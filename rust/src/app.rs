@@ -1,52 +1,321 @@
-//! AppCSXCAD application logic: menus, file I/O, settings, exports.
+//! AppCSXCAD application logic: menus, file I/O, settings and exports.
 //!
-//! Wraps `qcsxcad_egui::EguiApp` with AppCSXCAD-specific behavior:
-//! menu bar, file operations, command-line arguments, and settings persistence.
+//! The application wraps `qcsxcad_egui::EguiApp` (the QCSXCAD library: tree,
+//! editors, 3D viewport) with the desktop behavior the native `AppCSXCAD`
+//! class adds: the File/Info menu, project loading and saving, the export
+//! actions, command-line arguments and window settings.
 
-use csxcad_core::model::Structure;
+use qcsxcad_core::export::{self, PropertyFormat};
 use qcsxcad_core::model::{GuiError, GuiState};
+use qcsxcad_core::ProjectFile;
 use qcsxcad_egui::EguiApp;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use winit::event::Event;
 
 const APP_NAME: &str = "AppCSXCAD";
+const DEFAULT_WIDTH: u32 = 1200;
+const DEFAULT_HEIGHT: u32 = 800;
 
-/// AppCSXCAD application: egui UI + wgpu 3D viewport with file I/O and settings.
-#[derive(Default)]
-pub struct AppCsxCad {
-    egui_app: EguiApp,
-    gui_state: GuiState,
-    filename: Option<PathBuf>,
-    edit_mode: bool,
-    show_about: bool,
-    export_polydata_vtk: Option<String>,
-    export_stl: Option<String>,
-    settings: AppSettings,
+/// Window settings persisted between sessions (native `QSettings`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AppSettings {
+    #[serde(default = "default_width")]
+    pub window_width: u32,
+    #[serde(default = "default_height")]
+    pub window_height: u32,
 }
 
-/// Persistent settings: window geometry and state.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct AppSettings {
-    pub window_geometry: Option<Vec<u8>>,
-    pub window_state: Option<Vec<u8>>,
+fn default_width() -> u32 {
+    DEFAULT_WIDTH
+}
+
+fn default_height() -> u32 {
+    DEFAULT_HEIGHT
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            window_width: DEFAULT_WIDTH,
+            window_height: DEFAULT_HEIGHT,
+        }
+    }
+}
+
+impl AppSettings {
+    fn path() -> PathBuf {
+        directories::ProjectDirs::from("", "", APP_NAME)
+            .map(|dirs| dirs.config_dir().to_path_buf())
+            .unwrap_or_else(std::env::temp_dir)
+            .join("settings.json")
+    }
+
+    pub fn load() -> Self {
+        let path = Self::path();
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+
+    /// Clamp a stored size to something a window manager will accept.
+    pub fn window_size(&self) -> (u32, u32) {
+        (
+            self.window_width.clamp(320, 16_384),
+            self.window_height.clamp(240, 16_384),
+        )
+    }
+}
+
+/// One pending file operation, applied after the frame is drawn.
+#[derive(Clone, Debug, PartialEq)]
+enum AppAction {
+    New,
+    Load(PathBuf),
+    Save,
+    SaveAs(PathBuf),
+    ExportXml(PathBuf),
+    ExportMesh(PropertyFormat, PathBuf),
+    ExportPovray(PathBuf),
+    ExportX3d(PathBuf),
+    Exit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dialog {
+    Load,
+    SaveAs,
+    ExportXml,
+    ExportVtk,
+    ExportStl,
+    ExportPly,
+    ExportPovray,
+    ExportX3d,
+}
+
+impl Dialog {
+    fn title(self) -> &'static str {
+        match self {
+            Dialog::Load => "Load CSXCAD project",
+            Dialog::SaveAs => "Save project as",
+            Dialog::ExportXml => "Export CSXCAD XML",
+            Dialog::ExportVtk => "Export Polydata-VTK into a directory",
+            Dialog::ExportStl => "Export STL into a directory",
+            Dialog::ExportPly => "Export PLY into a directory",
+            Dialog::ExportPovray => "Export POV-Ray scene",
+            Dialog::ExportX3d => "Export X3D scene",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Dialog::Load => "project.xml",
+            Dialog::SaveAs | Dialog::ExportXml => "geometry.xml",
+            Dialog::ExportVtk | Dialog::ExportStl | Dialog::ExportPly => "export-directory",
+            Dialog::ExportPovray => "scene.pov",
+            Dialog::ExportX3d => "scene.x3d",
+        }
+    }
+
+    fn target(self, path: PathBuf) -> AppAction {
+        match self {
+            Dialog::Load => AppAction::Load(path),
+            Dialog::SaveAs => AppAction::SaveAs(path),
+            Dialog::ExportXml => AppAction::ExportXml(path),
+            Dialog::ExportVtk => AppAction::ExportMesh(PropertyFormat::PolyDataVtk, path),
+            Dialog::ExportStl => AppAction::ExportMesh(PropertyFormat::Stl, path),
+            Dialog::ExportPly => AppAction::ExportMesh(PropertyFormat::Ply, path),
+            Dialog::ExportPovray => AppAction::ExportPovray(path),
+            Dialog::ExportX3d => AppAction::ExportX3d(path),
+        }
+    }
+}
+
+/// Presentation state the menu and dialogs need.
+#[derive(Clone, Debug, Default)]
+struct AppUiState {
+    path_input: String,
+    dialog: Option<Dialog>,
+    about: bool,
+    error: Option<String>,
+    action: Option<AppAction>,
+}
+
+impl AppUiState {
+    fn open_dialog(&mut self, dialog: Dialog, suggestion: &str) {
+        self.dialog = Some(dialog);
+        self.path_input = suggestion.to_owned();
+    }
+
+    fn take_action(&mut self) -> Option<AppAction> {
+        self.action.take()
+    }
+
+    /// Draw the menu bar. Runs inside the egui frame, before the QCSXCAD panels.
+    fn menu(&mut self, ui: &mut egui::Ui, edit_mode: bool, has_document: bool) {
+        egui::Panel::top("app_menu").show(ui, |ui| {
+            egui::menu::MenuBar::default().ui(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if edit_mode && ui.button("New").clicked() {
+                        self.action = Some(AppAction::New);
+                        ui.close();
+                    }
+                    if ui.button("Load…").clicked() {
+                        self.open_dialog(Dialog::Load, "");
+                        ui.close();
+                    }
+                    if edit_mode && ui.button("Save").clicked() {
+                        self.action = Some(AppAction::Save);
+                        ui.close();
+                    }
+                    if edit_mode && ui.button("Save As…").clicked() {
+                        self.open_dialog(Dialog::SaveAs, "");
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.menu_button("Export", |ui| {
+                        if edit_mode && ui.button("CSXCAD XML").clicked() {
+                            self.open_dialog(Dialog::ExportXml, "");
+                            ui.close();
+                        }
+                        if ui.button("Polydata-VTK").clicked() {
+                            self.open_dialog(Dialog::ExportVtk, "vtk");
+                            ui.close();
+                        }
+                        if ui.button("STL").clicked() {
+                            self.open_dialog(Dialog::ExportStl, "stl");
+                            ui.close();
+                        }
+                        if ui.button("PLY").clicked() {
+                            self.open_dialog(Dialog::ExportPly, "ply");
+                            ui.close();
+                        }
+                        if ui.button("POV-Ray").clicked() {
+                            self.open_dialog(Dialog::ExportPovray, "scene.pov");
+                            ui.close();
+                        }
+                        if ui.button("X3D").clicked() {
+                            self.open_dialog(Dialog::ExportX3d, "scene.x3d");
+                            ui.close();
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Exit").clicked() {
+                        self.action = Some(AppAction::Exit);
+                        ui.close();
+                    }
+                });
+                ui.menu_button("Info", |ui| {
+                    if ui.button("About").clicked() {
+                        self.about = true;
+                        ui.close();
+                    }
+                });
+                ui.separator();
+                if !has_document {
+                    ui.label("no project loaded");
+                }
+            });
+        });
+
+        self.show_dialog(ui);
+        self.show_about(ui);
+        if let Some(error) = &self.error {
+            egui::Panel::bottom("app_error").show(ui, |ui| {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
+            });
+        }
+    }
+
+    fn show_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.dialog else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new(dialog.title())
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("Path ({})", dialog.hint()));
+                ui.text_edit_singleline(&mut self.path_input);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            let path = PathBuf::from(self.path_input.trim());
+            if path.as_os_str().is_empty() {
+                self.error = Some("Enter a path".into());
+            } else {
+                self.action = Some(dialog.target(path));
+                self.dialog = None;
+                self.error = None;
+            }
+        } else if cancel || !open {
+            self.dialog = None;
+        }
+    }
+
+    fn show_about(&mut self, ui: &mut egui::Ui) {
+        if !self.about {
+            return;
+        }
+        egui::Window::new("About AppCSXCAD")
+            .open(&mut self.about)
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.label("AppCSXCAD");
+                ui.label("CSXCAD geometry viewer and editor");
+                ui.label("Ported to Rust with egui + wgpu");
+                ui.separator();
+                ui.label("Copyright (C) 2012-2015 Thorsten Liebig");
+                ui.label("GPL-3.0-or-later");
+            });
+    }
+}
+
+/// AppCSXCAD application: egui UI + wgpu 3D viewport with file I/O and settings.
+pub struct AppCsxCad {
+    egui_app: EguiApp,
+    file: ProjectFile,
+    edit_mode: bool,
+    ui_state: AppUiState,
+    /// `--RenderDiscMaterial` (native flag; discrete-material drawing is not
+    /// ported yet, tracked as RM-147).
+    render_disc_models: bool,
 }
 
 impl AppCsxCad {
     /// Create a new AppCSXCAD application.
     pub fn new(egui_app: EguiApp) -> Self {
-        let settings = AppSettings::load();
-        Self {
+        let app = Self {
             egui_app,
-            gui_state: GuiState::new(),
-            filename: None,
+            file: ProjectFile::new(),
             edit_mode: true,
-            show_about: false,
-            export_polydata_vtk: None,
-            export_stl: None,
-            settings,
-        }
+            ui_state: AppUiState::default(),
+            render_disc_models: false,
+        };
+        app.update_title();
+        app
     }
 
     /// Handle a winit event.
@@ -54,427 +323,386 @@ impl AppCsxCad {
         self.egui_app.handle_event(event);
     }
 
-    /// Handle window resize.
-    pub fn handle_resize(&mut self, _width: u32, _height: u32) {
-        // The wgpu surface resize is handled by EguiApp internally.
-    }
-
-    /// Render one frame.
-    pub fn render(&mut self) -> Result<(), GuiError> {
-        self.egui_app.render()
-    }
-
-    /// Build the egui UI for one frame.
-    pub fn ui(&mut self, ctx: &egui::Context) {
-        let _output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            self.menu_bar(ui);
-            self.central_panel(ui);
-
-            if self.show_about {
-                egui::Window::new("About AppCSXCAD")
-                    .open(&mut self.show_about)
-                    .show(ctx, |ui| {
-                        ui.label("AppCSXCAD");
-                        ui.label("CSXCAD geometry viewer and editor");
-                        ui.label("Ported to Rust with egui + wgpu");
-                        ui.separator();
-                        ui.label("Copyright (C) 2012-2015 Thorsten Liebig");
-                        ui.label("GPL-3.0-or-later");
-                    });
-            }
-        });
-    }
-
-    /// Request a redraw of the window.
+    /// Request a redraw (the winit handler calls this every wake-up).
     pub fn request_redraw(&self) {
         self.egui_app.request_redraw();
     }
 
-    /// Menu bar: File and Info menus.
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("menu_bar").show(ui, |ui| {
-            egui::menu::MenuBar::default().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if self.edit_mode {
-                        if ui.button("New").clicked() {
-                            self.new_file();
-                            ui.close();
-                        }
-                    }
-                    if ui.button("Load…").clicked() {
-                        self.load_file();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if self.edit_mode {
-                        if ui.button("Save").clicked() {
-                            self.save_file();
-                            ui.close();
-                        }
-                        if ui.button("Save As…").clicked() {
-                            self.save_as_file();
-                            ui.close();
-                        }
-                        ui.separator();
-                    }
-                    ui.menu_button("Export", |ui| {
-                        if ui.button("CSXCAD XML").clicked() {
-                            self.export_csxcad_xml();
-                            ui.close();
-                        }
-                        if ui.button("Povray").clicked() {
-                            self.export_povray();
-                            ui.close();
-                        }
-                        if ui.button("Polydata-VTK").clicked() {
-                            self.export_polydata_vtk_menu();
-                            ui.close();
-                        }
-                        if ui.button("STL").clicked() {
-                            self.export_stl_menu();
-                            ui.close();
-                        }
-                        if ui.button("PLY").clicked() {
-                            self.export_ply();
-                            ui.close();
-                        }
-                        if ui.button("3D view to PNG").clicked() {
-                            self.export_view_to_image();
-                            ui.close();
-                        }
-                        if ui.button("X3D").clicked() {
-                            self.export_x3d();
-                            ui.close();
-                        }
-                    });
-                    ui.separator();
-                    if ui.button("Exit").clicked() {
-                        self.save_settings();
-                        std::process::exit(0);
-                    }
-                });
-                ui.menu_button("Info", |ui| {
-                    if ui.button("About").clicked() {
-                        self.show_about = true;
-                        ui.close();
-                    }
-                });
-            });
-        });
+    /// Handle window resize.
+    pub fn handle_resize(&mut self, width: u32, height: u32) {
+        if width > 0 && height > 0 {
+            self.egui_app.resize(width, height);
+        }
     }
 
-    /// Central panel: placeholder content.
-    fn central_panel(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("AppCSXCAD");
-            if self.filename.is_none() {
-                ui.label("No structure loaded. Use File → Load to open a CSXCAD XML file.");
-            } else {
-                ui.label(format!("Loaded: {:?}", self.filename.as_deref().map(|p| p.display().to_string()).unwrap_or_default()));
+    /// Render one frame and apply the pending file action.
+    pub fn render(&mut self) -> Result<(), GuiError> {
+        let edit_mode = self.edit_mode;
+        let has_document = self.egui_app.document().is_some();
+        let ui_state = &mut self.ui_state;
+        let egui_app = &mut self.egui_app;
+        egui_app.render_with(|root, _document, _state| {
+            ui_state.menu(root, edit_mode, has_document);
+        })?;
+        if let Some(action) = self.ui_state.take_action() {
+            if let Err(error) = self.apply_action(action) {
+                self.ui_state.error = Some(error.to_string());
             }
-            ui.separator();
-            if let Some(structure) = self.egui_app.structure() {
-                ui.label(format!("Properties: {}", structure.property_count()));
-            }
-        });
+        }
+        Ok(())
     }
 
-    // ----- File operations -----
-
-    fn new_file(&mut self) {
-        self.egui_app.clear_structure();
-        self.filename = None;
-        self.gui_state = GuiState::new();
-        println!("New file created");
+    fn apply_action(&mut self, action: AppAction) -> Result<(), GuiError> {
+        match action {
+            AppAction::New => {
+                self.egui_app.clear_structure();
+                self.file = ProjectFile::new();
+                self.ui_state.error = None;
+                self.update_title();
+                Ok(())
+            }
+            AppAction::Load(path) => self.load_path(&path),
+            AppAction::Save => self.save(),
+            AppAction::SaveAs(path) => self.save_as(&path),
+            AppAction::ExportXml(path) => self.export_xml(&path),
+            AppAction::ExportMesh(format, directory) => self.export_mesh(format, &directory),
+            AppAction::ExportPovray(path) => self.export_povray(&path),
+            AppAction::ExportX3d(path) => self.export_x3d(&path),
+            AppAction::Exit => {
+                self.save_settings();
+                std::process::exit(0);
+            }
+        }
     }
 
-    fn load_file(&mut self) {
-        let path = self.filename.as_ref().cloned().unwrap_or_else(|| {
-            PathBuf::from(Self::prompt_input("Enter file path to load: "))
-        });
-        let mut file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Failed to open {}: {}", path.display(), e);
-                return;
-            }
+    // ----- project I/O -----
+
+    /// Load a CSXCAD or openEMS project file.
+    pub fn load_path(&mut self, path: impl AsRef<Path>) -> Result<(), GuiError> {
+        let (document, file) = ProjectFile::read_file(path)?;
+        self.egui_app.load_document(document);
+        self.file = file;
+        self.ui_state.path_input = self
+            .file
+            .path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        self.ui_state.error = None;
+        self.update_title();
+        Ok(())
+    }
+
+    /// Save to the current project path.
+    pub fn save(&mut self) -> Result<(), GuiError> {
+        let Some(document) = self.egui_app.document_mut() else {
+            return Err(GuiError::Model("there is no project to save".into()));
         };
-        let mut xml = String::new();
-        if file.read_to_string(&mut xml).is_err() {
-            eprintln!("Failed to read {}", path.display());
-            return;
+        if self.file.path().is_none() {
+            return Err(GuiError::Model(
+                "the project has no path; use Save As".into(),
+            ));
         }
-
-        match Structure::from_xml_str(&xml) {
-            Ok(structure) => {
-                self.egui_app.load_structure(structure);
-                self.filename = Some(path.clone());
-                self.gui_state.modified = false;
-                println!("Loaded {} ({} bytes)", path.display(), xml.len());
-            }
-            Err(e) => {
-                eprintln!("Failed to parse XML from {}: {}", path.display(), e);
-            }
-        }
+        self.file.save(document)?;
+        self.update_title();
+        Ok(())
     }
 
-    fn save_file(&mut self) {
-        let path = match self.filename.as_ref() {
-            Some(p) => p.clone(),
-            None => return self.save_as_file(),
+    /// Save to `path`.
+    ///
+    /// Native `AppCSXCAD::ExportGeometry` leaves its internal filename
+    /// unchanged, so a following Save writes the previous file. The port makes
+    /// Save As adopt the new path (documented in `audits/gui.md`).
+    pub fn save_as(&mut self, path: impl AsRef<Path>) -> Result<(), GuiError> {
+        let Some(document) = self.egui_app.document_mut() else {
+            return Err(GuiError::Model("there is no project to save".into()));
         };
-        self.save_to_path(&path);
+        self.file.write(document, path)?;
+        self.ui_state.path_input = self
+            .file
+            .path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        self.update_title();
+        Ok(())
     }
 
-    fn save_as_file(&mut self) {
-        let path = Self::prompt_input("Enter file path to save: ");
-        let path = PathBuf::from(path);
-        self.save_to_path(&path);
-        self.filename = Some(path);
-    }
+    // ----- exports -----
 
-    fn save_to_path(&mut self, path: &std::path::Path) {
-        let structure = match self.egui_app.structure() {
-            Some(s) => s,
-            None => {
-                eprintln!("No structure to save");
-                return;
-            }
+    /// Export the model as a CSXCAD XML file (native `QCSXCAD::Write2XML`).
+    pub fn export_xml(&mut self, path: impl AsRef<Path>) -> Result<(), GuiError> {
+        let Some(document) = self.egui_app.document() else {
+            return Err(GuiError::Model("there is no project to export".into()));
         };
-
-        match structure.to_xml_string() {
-            Ok(xml) => {
-                match File::create(path).and_then(|mut f| f.write_all(xml.as_bytes())) {
-                    Ok(()) => {
-                        self.gui_state.modified = false;
-                        println!("Saved {} ({} bytes)", path.display(), xml.len());
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to write {}: {}", path.display(), e);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to serialize structure: {}", e);
-            }
-        }
+        let xml = document
+            .structure()
+            .to_xml_string()
+            .map_err(|error| GuiError::Xml(error.to_string()))?;
+        let path = path.as_ref();
+        std::fs::write(path, xml)
+            .map_err(|error| GuiError::Io(format!("could not write {}: {error}", path.display())))
     }
 
-    /// Prompt the user for a line of input on stdin.
-    fn prompt_input(prompt: &str) -> String {
-        print!("{}", prompt);
-        let _ = std::io::stdout().flush();
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).ok();
-        input.trim().to_string()
-    }
-
-    // ----- Export operations -----
-
-    fn export_csxcad_xml(&self) {
-        let structure = match self.egui_app.structure() {
-            Some(s) => s,
-            None => {
-                eprintln!("No structure to export");
-                return;
-            }
+    /// Export every visible property (native `ExportGeometry(dir, type)`).
+    pub fn export_mesh(
+        &mut self,
+        format: PropertyFormat,
+        directory: impl AsRef<Path>,
+    ) -> Result<(), GuiError> {
+        let Some(document) = self.egui_app.document() else {
+            return Err(GuiError::Model("there is no project to export".into()));
         };
-        let path = Self::prompt_input("Enter CSXCAD XML output path: ");
-        match structure.to_xml_string() {
-            Ok(xml) => {
-                match std::fs::write(&path, xml) {
-                    Ok(()) => println!("Exported CSXCAD XML to {}", path),
-                    Err(e) => eprintln!("Failed to write {}: {}", path, e),
-                }
-            }
-            Err(e) => eprintln!("Failed to serialize structure: {}", e),
-        }
+        export::export_properties(document.structure(), directory, format)?;
+        Ok(())
     }
 
-    fn export_povray(&self) {
-        let _structure = match self.egui_app.structure() {
-            Some(s) => s,
-            None => {
-                eprintln!("No structure to export");
-                return;
-            }
+    /// Export a POV-Ray scene.
+    pub fn export_povray(&mut self, path: impl AsRef<Path>) -> Result<(), GuiError> {
+        let Some(document) = self.egui_app.document() else {
+            return Err(GuiError::Model("there is no project to export".into()));
         };
-        let path = Self::prompt_input("Enter POV-Ray output path: ");
-        let mut pov = String::new();
-        pov.push_str("#declare openEMS_export = union{\n");
-        // Iterate over primitives and write POV-Ray geometry
-        // Note: Structure doesn't expose a primitive iterator directly,
-        // so we write a minimal POV-Ray scene with a placeholder box.
-        pov.push_str("  box { <-1,-1,-1> <1,1,1> pigment { color rgb <1,0,0> } }\n");
-        pov.push_str("}\n");
-        match std::fs::write(&path, pov) {
-            Ok(()) => println!("Exported POV-Ray to {}", path),
-            Err(e) => eprintln!("Failed to write {}: {}", path, e),
-        }
+        export::export_povray(document.structure(), path)
     }
 
-    fn export_polydata_vtk_menu(&mut self) {
-        let path = Self::prompt_input("Enter Polydata-VTK output path: ");
-        let vtk = "# vtk DataFile Version 3.0\nAppCSXCAD export\nASCII\nDATASET POLYDATA\nPOINTS 0 float\nPOLYGONS 0 0\n";
-        match std::fs::write(&path, vtk) {
-            Ok(()) => println!("Exported Polydata-VTK to {}", path),
-            Err(e) => eprintln!("Failed to write {}: {}", path, e),
-        }
+    /// Export an X3D scene.
+    pub fn export_x3d(&mut self, path: impl AsRef<Path>) -> Result<(), GuiError> {
+        let Some(document) = self.egui_app.document() else {
+            return Err(GuiError::Model("there is no project to export".into()));
+        };
+        export::export_x3d(document.structure(), path)
     }
 
-    fn export_stl_menu(&mut self) {
-        let path = Self::prompt_input("Enter STL output path: ");
-        // Binary STL: 80-byte header + u32 triangle count + triangles
-        let mut stl = vec![0u8; 80];
-        stl.extend_from_slice(&0u32.to_le_bytes()); // 0 triangles
-        match std::fs::write(&path, stl) {
-            Ok(()) => println!("Exported STL to {}", path),
-            Err(e) => eprintln!("Failed to write {}: {}", path, e),
-        }
-    }
+    // ----- command line -----
 
-    fn export_ply(&self) {
-        let path = Self::prompt_input("Enter PLY output path: ");
-        let ply = "ply\nformat ascii 1.0\nelement vertex 0\nproperty float x\nproperty float y\nproperty float z\nelement face 0\nproperty list uchar int vertex_indices\nend_header\n";
-        match std::fs::write(&path, ply) {
-            Ok(()) => println!("Exported PLY to {}", path),
-            Err(e) => eprintln!("Failed to write {}: {}", path, e),
-        }
-    }
-
-    fn export_view_to_image(&self) {
-        let path = Self::prompt_input("Enter PNG output path: ");
-        // Write a minimal PNG (1x1 transparent pixel)
-        let png: [u8; 67] = [
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
-            0x00, 0x00, 0x00, 0x0D, 'I' as u8, 'H' as u8, 'D' as u8, 'R' as u8, // IHDR
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00,
-            0x1F, 0x15, 0xC4, 0x89, // IHDR data + CRC
-            0x00, 0x00, 0x00, 0x0C, 'I' as u8, 'D' as u8, 'A' as u8, 'T' as u8, // IDAT
-            0x08, 0xD7, 0x63, 0xF8, 0x0F, 0x00, 0x00, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x88, 0xBF,
-            0x00, 0x00, 0x00, 0x00, 'I' as u8, 'E' as u8, 'N' as u8, 'D' as u8, // IEND
-            0xAE, 0x42, 0x60, 0x82,
-        ];
-        match std::fs::write(&path, &png) {
-            Ok(()) => println!("Exported view to PNG: {}", path),
-            Err(e) => eprintln!("Failed to write {}: {}", path, e),
-        }
-    }
-
-    fn export_x3d(&self) {
-        let path = Self::prompt_input("Enter X3D output path: ");
-        let x3d = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE X3D PUBLIC \"ISO//Web3D//DTD X3D 3.0//EN\" \"http://www.web3d.org/specifications/x3d-3.0.dtd\">\n<X3D profile=\"Immersive\" version=\"3.0\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema-instance\" xsd:noNamespaceSchemaLocation=\"http://www.web3d.org/specifications/x3d-3.0.xsd\">\n<Scene>\n<Shape>\n<Box size=\"2 2 2\"/>\n<Appearance><Material diffuseColor=\"1 0 0\"/></Appearance>\n</Shape>\n</Scene>\n</X3D>\n";
-        match std::fs::write(&path, x3d) {
-            Ok(()) => println!("Exported X3D to {}", path),
-            Err(e) => eprintln!("Failed to write {}: {}", path, e),
-        }
-    }
-
-    // ----- Command-line argument parsing -----
-
-    /// Parse command-line arguments and set up export operations.
+    /// Parse the native AppCSXCAD command line.
+    ///
+    /// Native loads the last argument that does not start with `-`, then parses
+    /// `--export-polydata-vtk=<dir>` and `--export-STL=<dir>` and runs them
+    /// immediately.
     pub fn parse_command_line_args(&mut self, args: &[String]) {
-        let mut i = 0;
-        while i < args.len() {
-            let arg = &args[i];
-            if arg.starts_with("--") {
-                let parts: Vec<&str> = arg.splitn(2, '=').collect();
-                match parts[0] {
-                    "--export-polydata-vtk" => {
-                        if parts.len() > 1 {
-                            self.export_polydata_vtk = Some(parts[1].to_string());
-                        } else if i + 1 < args.len() {
-                            self.export_polydata_vtk = Some(args[i + 1].to_string());
-                            i += 1;
-                        }
-                    }
-                    "--export-stl" => {
-                        if parts.len() > 1 {
-                            self.export_stl = Some(parts[1].to_string());
-                        } else if i + 1 < args.len() {
-                            self.export_stl = Some(args[i + 1].to_string());
-                            i += 1;
-                        }
-                    }
-                    _ => {
-                        eprintln!("Unknown argument: {arg}");
-                    }
-                }
-            } else if !arg.starts_with('-') {
-                // Positional argument: treat as file to load.
-                self.filename = Some(std::path::PathBuf::from(arg));
-                // Load the file immediately
-                let path = PathBuf::from(arg);
-                if let Ok(mut file) = File::open(&path) {
-                    let mut xml = String::new();
-                    if file.read_to_string(&mut xml).is_ok() {
-                        if let Ok(structure) = Structure::from_xml_str(&xml) {
-                            self.egui_app.load_structure(structure);
-                            self.filename = Some(path.clone());
-                            println!("Loaded {} ({} bytes)", path.display(), xml.len());
-                        } else {
-                            eprintln!("Failed to parse XML from {}", path.display());
-                        }
-                    } else {
-                        eprintln!("Failed to read {}", path.display());
-                    }
-                } else {
-                    eprintln!("Failed to open {}", path.display());
-                }
+        if let Some(positional) = args.iter().rev().find(|arg| !arg.starts_with('-')) {
+            if let Err(error) = self.load_path(positional) {
+                self.ui_state.error = Some(error.to_string());
+                eprintln!("AppCSXCAD: {error}");
             }
-            i += 1;
+        }
+        for argument in args {
+            if let Some(directory) = argument.strip_prefix("--export-polydata-vtk=") {
+                println!("AppCSXCAD - exporting 3D view to polydata vtk");
+                if let Err(error) = self.export_mesh(PropertyFormat::PolyDataVtk, Path::new(directory)) {
+                    eprintln!("AppCSXCAD: {error}");
+                    self.ui_state.error = Some(error.to_string());
+                }
+            } else if let Some(directory) = argument.strip_prefix("--export-STL=") {
+                println!("AppCSXCAD - exporting 3D data to STL");
+                if let Err(error) = self.export_mesh(PropertyFormat::Stl, Path::new(directory)) {
+                    eprintln!("AppCSXCAD: {error}");
+                    self.ui_state.error = Some(error.to_string());
+                }
+            } else if argument == "--disableEdit" {
+                println!("QCSXCAD - disabling editing");
+                self.edit_mode = false;
+                self.update_title();
+            } else if argument == "--RenderDiscMaterial" {
+                // native sets the render flag (and, due to the recorded source
+                // defect, also the edit flag); the port keeps them separate
+                println!("QCSXCAD - Render discrete material");
+                self.render_disc_models = true;
+            } else if argument.starts_with('-') && argument != "--help" && argument != "-h" {
+                eprintln!("AppCSXCAD: unknown argument: {argument}");
+            }
         }
     }
 
-    /// Save settings on shutdown.
+    // ----- settings and title -----
+
+    /// Save window settings on shutdown.
     pub fn save_settings(&self) {
-        self.settings.save();
-    }
-
-    /// Load settings on startup.
-    pub fn load_settings(&mut self) {
-        self.settings = AppSettings::load();
-    }
-
-    /// Get the window title.
-    pub fn title(&self) -> String {
-        if self.edit_mode {
-            APP_NAME.to_string()
-        } else {
-            format!("{} - {}", APP_NAME, "View Mode")
+        let (window_width, window_height) = self
+            .egui_app
+            .window_size()
+            .unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
+        AppSettings {
+            window_width,
+            window_height,
         }
+        .save();
+    }
+
+    /// Window title, following the native "View Mode" suffix.
+    pub fn title(&self) -> String {
+        let mut title = APP_NAME.to_string();
+        if let Some(path) = self.file.path() {
+            title.push_str(" - ");
+            title.push_str(&path.display().to_string());
+        }
+        if !self.edit_mode {
+            title.push_str(" - View Mode");
+        }
+        title
+    }
+
+    fn update_title(&self) {
+        self.egui_app.set_title(&self.title());
+    }
+
+    #[cfg(test)]
+    fn ui_state(&self) -> &AppUiState {
+        &self.ui_state
     }
 }
 
-impl AppSettings {
-    /// Get the settings file path.
-    fn path() -> PathBuf {
-        directories::ProjectDirs::from("", "", APP_NAME)
-            .map(|d| d.config_dir().to_path_buf())
-            .unwrap_or_else(|| std::env::temp_dir())
-            .join("settings.json")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROJECT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<openEMS>
+  <FDTD NumberOfTimesteps="1000"/>
+  <ContinuousStructure CoordSystem="0">
+    <Properties>
+      <Metal Name="ground">
+        <Primitives>
+          <Box Priority="1"><P1 X="-1" Y="-1" Z="-1"/><P2 X="1" Y="1" Z="0"/></Box>
+        </Primitives>
+      </Metal>
+    </Properties>
+  </ContinuousStructure>
+  <Excitation Type="0" f0="1e9"/>
+</openEMS>"#;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "appcsxcad-test-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        directory
     }
 
-    /// Load settings from disk.
-    fn load() -> Self {
-        let path = Self::path();
-        if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default()
-        } else {
-            Self::default()
-        }
+    fn app() -> AppCsxCad {
+        AppCsxCad::new(EguiApp::new())
     }
 
-    /// Save settings to disk.
-    fn save(&self) {
-        if let Some(parent) = Self::path().parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(Self::path(), json);
-        }
+    #[test]
+    fn loading_and_saving_a_project_keeps_the_openems_wrapper() {
+        let directory = temp_dir("io");
+        let source = directory.join("project.xml");
+        std::fs::write(&source, PROJECT).expect("write fixture");
+        let mut app = app();
+        app.load_path(&source).expect("load");
+        assert_eq!(app.egui_app.structure().expect("structure").property_count(), 1);
+        assert!(app.title().contains("project.xml"));
+        assert!(!app.egui_app.document().expect("document").is_modified());
+
+        // edit, then Save writes the same file with the wrapper intact
+        app.egui_app
+            .document_mut()
+            .expect("document")
+            .add_property(csxcad_core::model::PropertyType::Material)
+            .expect("property");
+        app.save().expect("save");
+        let written = std::fs::read_to_string(&source).expect("read");
+        assert!(written.contains("<openEMS>"));
+        assert!(written.contains("<FDTD NumberOfTimesteps=\"1000\"/>"));
+        assert!(written.contains("<Excitation Type=\"0\" f0=\"1e9\"/>"));
+        assert_eq!(written.matches("<ContinuousStructure").count(), 1);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn save_as_adopts_the_new_path() {
+        let directory = temp_dir("saveas");
+        let mut app = app();
+        app.egui_app
+            .load_document(qcsxcad_core::document::Document::from_structure(
+                csxcad_core::model::Structure::new(),
+            ));
+        let target = directory.join("new.xml");
+        app.save_as(&target).expect("save as");
+        assert_eq!(app.file.path(), Some(target.as_path()));
+        assert!(target.exists());
+        // a plain Save now writes the new file
+        app.egui_app
+            .document_mut()
+            .expect("document")
+            .add_property(csxcad_core::model::PropertyType::Metal)
+            .expect("property");
+        app.save().expect("save");
+        let written = std::fs::read_to_string(&target).expect("read");
+        assert!(written.contains("<Metal"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn exports_write_real_files() {
+        let directory = temp_dir("exports");
+        let source = directory.join("project.xml");
+        std::fs::write(&source, PROJECT).expect("write fixture");
+        let mut app = app();
+        app.load_path(&source).expect("load");
+
+        let xml = directory.join("geometry.xml");
+        app.export_xml(&xml).expect("xml");
+        assert!(std::fs::read_to_string(&xml).expect("read").contains("<Metal"));
+
+        let vtk = directory.join("vtk");
+        app.export_mesh(PropertyFormat::PolyDataVtk, &vtk).expect("vtk");
+        assert!(vtk.join("ground.vtp").exists());
+
+        let stl = directory.join("stl");
+        app.export_mesh(PropertyFormat::Stl, &stl).expect("stl");
+        assert!(stl.join("ground.stl").exists());
+
+        let ply = directory.join("ply");
+        app.export_mesh(PropertyFormat::Ply, &ply).expect("ply");
+        assert!(ply.join("ground.ply").exists());
+
+        let pov = directory.join("scene.pov");
+        app.export_povray(&pov).expect("pov");
+        assert!(std::fs::read_to_string(&pov).expect("read").contains("mesh2"));
+
+        let x3d = directory.join("scene.x3d");
+        app.export_x3d(&x3d).expect("x3d");
+        assert!(std::fs::read_to_string(&x3d).expect("read").contains("IndexedFaceSet"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn command_line_loads_the_last_positional_file_and_runs_exports() {
+        let directory = temp_dir("cli");
+        let source = directory.join("project.xml");
+        std::fs::write(&source, PROJECT).expect("write fixture");
+        let export = directory.join("cli-vtk");
+        let mut app = app();
+        app.parse_command_line_args(&[
+            "--disableEdit".to_string(),
+            format!("--export-polydata-vtk={}", export.display()),
+            source.display().to_string(),
+        ]);
+        // native loads the file before parsing the export switches
+        assert!(export.join("ground.vtp").exists());
+        assert!(!app.edit_mode);
+        assert!(app.title().ends_with(" - View Mode"));
+        assert!(app.ui_state().error.is_none());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_missing_project_is_reported_without_panicking() {
+        let mut app = app();
+        app.parse_command_line_args(&["definitely-missing-project.xml".to_string()]);
+        assert!(app.ui_state().error.is_some());
+        assert!(app.egui_app.structure().is_none());
+    }
+
+    #[test]
+    fn settings_round_trip_and_clamp() {
+        let settings = AppSettings {
+            window_width: 100,
+            window_height: 10,
+        };
+        assert_eq!(settings.window_size(), (320, 240));
+        let settings = AppSettings::default();
+        assert_eq!(settings.window_size(), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
     }
 }

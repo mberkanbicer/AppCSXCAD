@@ -18,14 +18,24 @@ impl ApplicationHandler<()> for AppHandler {
             return;
         }
 
-        let window = event_loop
-            .create_window(
-                WindowAttributes::default()
-                    .with_title("AppCSXCAD")
-                    .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0))
-                    .with_min_inner_size(winit::dpi::LogicalSize::new(400.0, 300.0)),
-            )
-            .unwrap();
+        let settings = app::AppSettings::load();
+        let (width, height) = settings.window_size();
+        let window = match event_loop.create_window(
+            WindowAttributes::default()
+                .with_title("AppCSXCAD")
+                .with_inner_size(winit::dpi::LogicalSize::new(
+                    f64::from(width),
+                    f64::from(height),
+                ))
+                .with_min_inner_size(winit::dpi::LogicalSize::new(400.0, 300.0)),
+        ) {
+            Ok(window) => window,
+            Err(error) => {
+                eprintln!("AppCSXCAD: could not create the window: {error}");
+                eprintln!("A graphical display is required to run the application.");
+                std::process::exit(1);
+            }
+        };
 
         let mut egui_app = qcsxcad_egui::EguiApp::new();
         pollster::block_on(egui_app.set_window(window));
