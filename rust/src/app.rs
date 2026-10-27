@@ -88,6 +88,7 @@ enum AppAction {
     ExportMesh(PropertyFormat, PathBuf),
     ExportPovray(PathBuf),
     ExportX3d(PathBuf),
+    ExportPng(PathBuf),
     Exit,
 }
 
@@ -101,6 +102,7 @@ enum Dialog {
     ExportPly,
     ExportPovray,
     ExportX3d,
+    ExportPng,
 }
 
 impl Dialog {
@@ -114,6 +116,7 @@ impl Dialog {
             Dialog::ExportPly => "Export PLY into a directory",
             Dialog::ExportPovray => "Export POV-Ray scene",
             Dialog::ExportX3d => "Export X3D scene",
+            Dialog::ExportPng => "Export the 3D view to PNG",
         }
     }
 
@@ -124,6 +127,7 @@ impl Dialog {
             Dialog::ExportVtk | Dialog::ExportStl | Dialog::ExportPly => "export-directory",
             Dialog::ExportPovray => "scene.pov",
             Dialog::ExportX3d => "scene.x3d",
+            Dialog::ExportPng => "view.png",
         }
     }
 
@@ -137,6 +141,7 @@ impl Dialog {
             Dialog::ExportPly => AppAction::ExportMesh(PropertyFormat::Ply, path),
             Dialog::ExportPovray => AppAction::ExportPovray(path),
             Dialog::ExportX3d => AppAction::ExportX3d(path),
+            Dialog::ExportPng => AppAction::ExportPng(path),
         }
     }
 }
@@ -208,7 +213,17 @@ impl AppUiState {
                             self.open_dialog(Dialog::ExportX3d, "scene.x3d");
                             ui.close();
                         }
+                        if ui.button("3D view to PNG").clicked() {
+                            self.open_dialog(Dialog::ExportPng, "view.png");
+                            ui.close();
+                        }
                     });
+                    // native Ctrl+P shortcut for the 3D view capture
+                    if ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::P)
+                    }) {
+                        self.open_dialog(Dialog::ExportPng, "view.png");
+                    }
                     ui.separator();
                     if ui.button("Exit").clicked() {
                         self.action = Some(AppAction::Exit);
@@ -368,6 +383,7 @@ impl AppCsxCad {
             AppAction::ExportMesh(format, directory) => self.export_mesh(format, &directory),
             AppAction::ExportPovray(path) => self.export_povray(&path),
             AppAction::ExportX3d(path) => self.export_x3d(&path),
+            AppAction::ExportPng(path) => self.export_view_png(&path),
             AppAction::Exit => {
                 self.save_settings();
                 std::process::exit(0);
@@ -469,6 +485,17 @@ impl AppCsxCad {
             return Err(GuiError::Model("there is no project to export".into()));
         };
         export::export_x3d(document.structure(), path)
+    }
+
+    /// Capture the 3D view into a PNG file.
+    pub fn export_view_png(&mut self, path: impl AsRef<Path>) -> Result<(), GuiError> {
+        let path = path.as_ref();
+        self.egui_app
+            .export_view_png(&path.display().to_string())
+            .map_err(|error| match error {
+                GuiError::Model(message) => GuiError::Model(message),
+                other => other,
+            })
     }
 
     // ----- command line -----
@@ -664,6 +691,13 @@ mod tests {
         let x3d = directory.join("scene.x3d");
         app.export_x3d(&x3d).expect("x3d");
         assert!(std::fs::read_to_string(&x3d).expect("read").contains("IndexedFaceSet"));
+
+        // without a window there is no GPU surface, so the capture reports an
+        // error instead of writing a placeholder (the real capture is covered
+        // by the renderer's offscreen test)
+        let png = directory.join("view.png");
+        assert!(app.export_view_png(&png).is_err());
+        assert!(!png.exists());
         let _ = std::fs::remove_dir_all(&directory);
     }
 
