@@ -31,7 +31,9 @@ impl ApplicationHandler<()> for AppHandler {
         pollster::block_on(egui_app.set_window(window));
 
         let mut app = AppCsxCad::new(egui_app);
-        let args: Vec<String> = std::env::args().collect();
+        // skip the program name; the native application only parses its own
+        // arguments
+        let args: Vec<String> = std::env::args().skip(1).collect();
         app.parse_command_line_args(&args);
 
         self.app = Some(app);
@@ -72,10 +74,47 @@ impl ApplicationHandler<()> for AppHandler {
     }
 }
 
+/// Version reported by `--version`.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Usage text reported by `--help`.
+const USAGE: &str = "\
+Usage: appcsxcad [OPTIONS] [FILE]
+
+Open a CSXCAD geometry file (XML). Without a file the application starts with
+an empty structure.
+
+Options:
+  -h, --help       Print this help text and exit
+  -V, --version    Print the version and exit
+";
+
 fn main() {
     env_logger::init();
 
-    let event_loop = EventLoop::new().unwrap();
+    // Resolve the informational arguments before creating the event loop so
+    // they work on headless systems (native AppCSXCAD prints the same).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{USAGE}");
+        return;
+    }
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("AppCSXCAD {VERSION}");
+        return;
+    }
+
+    let event_loop = match EventLoop::new() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            eprintln!("AppCSXCAD: could not create the window event loop: {error}");
+            eprintln!("A graphical display is required to run the application.");
+            std::process::exit(1);
+        }
+    };
     let mut handler = AppHandler { app: None };
-    event_loop.run_app(&mut handler).unwrap();
+    if let Err(error) = event_loop.run_app(&mut handler) {
+        eprintln!("AppCSXCAD: event loop error: {error}");
+        std::process::exit(1);
+    }
 }
