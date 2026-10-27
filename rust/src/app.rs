@@ -314,9 +314,6 @@ pub struct AppCsxCad {
     file: ProjectFile,
     edit_mode: bool,
     ui_state: AppUiState,
-    /// `--RenderDiscMaterial` (native flag; discrete-material drawing is not
-    /// ported yet, tracked as RM-147).
-    render_disc_models: bool,
 }
 
 impl AppCsxCad {
@@ -327,7 +324,6 @@ impl AppCsxCad {
             file: ProjectFile::new(),
             edit_mode: true,
             ui_state: AppUiState::default(),
-            render_disc_models: false,
         };
         app.update_title();
         app
@@ -533,7 +529,7 @@ impl AppCsxCad {
                 // native sets the render flag (and, due to the recorded source
                 // defect, also the edit flag); the port keeps them separate
                 println!("QCSXCAD - Render discrete material");
-                self.render_disc_models = true;
+                self.egui_app.gui_state_mut().render_disc_models = true;
             } else if argument.starts_with('-') && argument != "--help" && argument != "-h" {
                 eprintln!("AppCSXCAD: unknown argument: {argument}");
             }
@@ -719,6 +715,16 @@ mod tests {
         assert!(app.title().ends_with(" - View Mode"));
         assert!(app.ui_state().error.is_none());
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn render_disc_material_sets_the_gui_state_without_touching_edit_mode() {
+        let mut app = app();
+        app.parse_command_line_args(&["--RenderDiscMaterial".to_string()]);
+        assert!(app.egui_app.gui_state().render_disc_models);
+        // the recorded native defect (the flag also toggles edit mode) is not
+        // reproduced
+        assert!(app.edit_mode);
     }
 
     #[test]
