@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
     textAction(toolbar, "CollapseAll");
     textAction(toolbar, "ExpandAll");
     toolbar->addSeparator();
-    for (const char *name : {"Material", "Metal", "Electrode", "ProbeBox", "ResBox", "DumpBox"}) {
+    for (const char *name : {"Material", "Metal", "Excitation", "ProbeBox", "ResBox", "DumpBox"}) {
         textAction(toolbar, name);
     }
     toolbar->addSeparator();
