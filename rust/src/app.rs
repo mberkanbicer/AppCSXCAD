@@ -273,12 +273,6 @@ impl AppUiState {
                             ui.close();
                         }
                     });
-                    // native Ctrl+P shortcut for the 3D view capture
-                    if ui.input_mut(|input| {
-                        input.consume_key(egui::Modifiers::COMMAND, egui::Key::P)
-                    }) {
-                        self.open_dialog(Dialog::ExportPng, "view.png");
-                    }
                     ui.separator();
                     if menu_item(ui, "Exit", icons.get("exit")).clicked() {
                         self.action = Some(AppAction::Exit);
@@ -291,6 +285,14 @@ impl AppUiState {
                         ui.close();
                     }
                 });
+                // Native Ctrl+P shortcut for the 3D view capture. It lives on
+                // the menu bar, not inside the File menu, so it also works
+                // while no menu is open.
+                if ui.input_mut(|input| {
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::P)
+                }) {
+                    self.open_dialog(Dialog::ExportPng, "view.png");
+                }
                 ui.separator();
                 if !has_document {
                     ui.label("no project loaded");
@@ -384,9 +386,21 @@ impl AppUiState {
         let mut open = true;
         let mut confirm = false;
         let mut cancel = false;
+        // Native dialogs confirm on Enter and cancel on Escape.
+        ui.input(|input| {
+            if input.key_pressed(egui::Key::Enter) {
+                confirm = true;
+            }
+            if input.key_pressed(egui::Key::Escape) {
+                cancel = true;
+            }
+        });
         egui::Window::new(dialog.title())
             .collapsible(false)
             .resizable(false)
+            // Centred like the native modal dialogs, not tucked into the
+            // top-left corner over the menu bar.
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .open(&mut open)
             .show(ui.ctx(), |ui| {
                 ui.label(format!("Path ({})", dialog.hint()));
@@ -871,6 +885,39 @@ mod tests {
         app.apply_action(AppAction::New).expect("new");
         assert!(app.egui_app.document().is_none());
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn every_dialog_maps_to_its_action() {
+        let path = PathBuf::from("out.bin");
+        let expected = [
+            (Dialog::Load, AppAction::Load(path.clone())),
+            (Dialog::SaveAs, AppAction::SaveAs(path.clone())),
+            (Dialog::ExportXml, AppAction::ExportXml(path.clone())),
+            (
+                Dialog::ExportVtk,
+                AppAction::ExportMesh(PropertyFormat::PolyDataVtk, path.clone()),
+            ),
+            (
+                Dialog::ExportStl,
+                AppAction::ExportMesh(PropertyFormat::Stl, path.clone()),
+            ),
+            (
+                Dialog::ExportPly,
+                AppAction::ExportMesh(PropertyFormat::Ply, path.clone()),
+            ),
+            (
+                Dialog::ExportPovray,
+                AppAction::ExportPovray(path.clone()),
+            ),
+            (Dialog::ExportX3d, AppAction::ExportX3d(path.clone())),
+            (Dialog::ExportPng, AppAction::ExportPng(path.clone())),
+        ];
+        for (dialog, action) in expected {
+            assert_eq!(dialog.target(path.clone()), action);
+            assert!(!dialog.title().is_empty());
+            assert!(!dialog.hint().is_empty());
+        }
     }
 
     #[test]
