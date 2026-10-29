@@ -429,6 +429,19 @@ impl AppCsxCad {
         Ok(())
     }
 
+    /// Start a new project with a usable 20 mm grid, so a created primitive is
+    /// visible and editable straight away. The grid is part of the initial
+    /// structure, not an undoable edit.
+    fn new_document_with_grid(&mut self) {
+        let mut structure = Structure::new();
+        for axis in 0..3 {
+            for step in 0..=20 {
+                structure.grid_mut().add_line(axis, step as f64 * 1.0e-3);
+            }
+        }
+        self.egui_app.load_structure(structure);
+    }
+
     fn apply_action(&mut self, action: AppAction) -> Result<(), GuiError> {
         match action {
             AppAction::New => {
@@ -448,7 +461,7 @@ impl AppCsxCad {
             AppAction::ExportPng(path) => self.export_view_png(&path),
             AppAction::AddProperty(kind) => {
                 if self.egui_app.document().is_none() {
-                    self.egui_app.load_structure(Structure::new());
+                    self.new_document_with_grid();
                 }
                 let id = self
                     .egui_app
@@ -460,7 +473,7 @@ impl AppCsxCad {
             }
             AppAction::AddPrimitive(kind) => {
                 if self.egui_app.document().is_none() {
-                    self.egui_app.load_structure(Structure::new());
+                    self.new_document_with_grid();
                 }
                 let property = self.egui_app.selection().properties.iter().copied().next();
                 let property = match property {
@@ -475,11 +488,30 @@ impl AppCsxCad {
                         id
                     }
                 };
+                // Native's "New Primitive" dialog starts from a degenerate
+                // shape; the toolbar gives it a visible 10 mm default so the
+                // user sees the object and can then edit the coordinates. The
+                // configuration is part of the same undo entry.
                 let id = self
                     .egui_app
                     .document_mut()
                     .expect("document exists")
-                    .add_primitive(property, kind)?;
+                    .add_primitive_with(property, kind, |primitive| {
+                        if let Some(box_shape) = primitive.box_shape_mut() {
+                            for index in 0..6 {
+                                // Interleaved start/stop per axis: 0/1 = x,
+                                // 2/3 = y, 4/5 = z.
+                                let value = if index % 2 == 0 { 0.0 } else { 10.0e-3 };
+                                box_shape.set_coordinate(index, value);
+                            }
+                        }
+                        if let Some(sphere) = primitive.sphere_shape_mut() {
+                            for axis in 0..3 {
+                                sphere.set_center_coordinate(axis, 5.0e-3);
+                            }
+                            sphere.set_radius(5.0e-3);
+                        }
+                    })?;
                 self.egui_app.select_primitive(id);
                 Ok(())
             }
@@ -764,6 +796,57 @@ mod tests {
         app.apply_action(AppAction::ExpandAll).expect("expand");
         app.apply_action(AppAction::CollapseAll).expect("collapse");
         app.apply_action(AppAction::ViewDir(2)).expect("view preset");
+    }
+
+    #[test]
+    fn a_created_box_is_visible_and_exported() {
+        let directory = temp_dir("create");
+        let mut app = app();
+        app.apply_action(AppAction::AddProperty(PropertyType::Material))
+            .expect("add property");
+        app.apply_action(AppAction::AddPrimitive(PrimitiveType::Box))
+            .expect("add box");
+        let document = app.egui_app.document().expect("document");
+        let primitive = document
+            .structure()
+            .all_primitives(false, csxcad_core::model::PropertyType::Any)
+            .first()
+            .and_then(|primitive| primitive.id())
+            .expect("the box exists");
+        let bounds = document
+            .structure()
+            .primitive(primitive)
+            .expect("primitive")
+            .bounding_box(None, false)
+            .expect("bounds");
+        assert!(bounds[1] > bounds[0] && bounds[3] > bounds[2] && bounds[5] > bounds[4]);
+        assert!((bounds[1] - 10.0e-3).abs() < 1.0e-12);
+        // The grid was created with the project, so the view has bounds.
+        let line_count = app
+            .egui_app
+            .document_mut()
+            .expect("document")
+            .structure_mut()
+            .grid_mut()
+            .line_count(0);
+        assert!(line_count >= 3);
+
+        let xml = directory.join("created.xml");
+        app.apply_action(AppAction::ExportXml(xml.clone()))
+            .expect("export");
+        let text = std::fs::read_to_string(&xml).expect("read");
+        assert!(text.contains("<Box"));
+        // The exported file round-trips to the same 10 mm cube.
+        let reparsed =
+            csxcad_core::model::Structure::from_xml_str(&text).expect("reparse the export");
+        let exported = reparsed
+            .all_primitives(false, csxcad_core::model::PropertyType::Any)
+            .first()
+            .expect("the exported box")
+            .bounding_box(None, false)
+            .expect("bounds");
+        assert!((exported[1] - exported[0] - 10.0e-3).abs() < 1.0e-12);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
