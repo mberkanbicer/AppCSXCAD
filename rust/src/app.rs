@@ -329,7 +329,7 @@ impl AppUiState {
                     for (label, kind) in [
                         ("Material", PropertyType::Material),
                         ("Metal", PropertyType::Metal),
-                        ("Electrode", PropertyType::Metal),
+                        ("Excitation", PropertyType::Excitation),
                         ("ProbeBox", PropertyType::ProbeBox),
                         ("ResBox", PropertyType::ResBox),
                         ("DumpBox", PropertyType::DumpBox),
@@ -814,6 +814,47 @@ mod tests {
 
     fn app() -> AppCsxCad {
         AppCsxCad::new(EguiApp::new())
+    }
+
+    #[test]
+    fn every_menu_action_runs_on_a_created_model() {
+        let directory = temp_dir("actions");
+        let mut app = app();
+        app.apply_action(AppAction::New).expect("new");
+        app.apply_action(AppAction::AddProperty(PropertyType::Material))
+            .expect("material");
+        app.apply_action(AppAction::AddPrimitive(PrimitiveType::Box))
+            .expect("box");
+        app.apply_action(AppAction::ExpandAll).expect("expand");
+        app.apply_action(AppAction::CollapseAll).expect("collapse");
+        app.apply_action(AppAction::ViewDir(2)).expect("view");
+        app.apply_action(AppAction::TransformMode(TransformMode::Scale))
+            .expect("scale tool");
+
+        let xml = directory.join("export.xml");
+        let vtk = directory.join("vtk");
+        let stl = directory.join("stl");
+        let ply = directory.join("ply");
+        let pov = directory.join("scene.pov");
+        let x3d = directory.join("scene.x3d");
+        let project = directory.join("project.xml");
+        for (action, path) in [
+            (AppAction::ExportXml(xml.clone()), xml.clone()),
+            (AppAction::ExportMesh(PropertyFormat::PolyDataVtk, vtk.clone()), vtk.clone()),
+            (AppAction::ExportMesh(PropertyFormat::Stl, stl.clone()), stl.clone()),
+            (AppAction::ExportMesh(PropertyFormat::Ply, ply.clone()), ply.clone()),
+            (AppAction::ExportPovray(pov.clone()), pov.clone()),
+            (AppAction::ExportX3d(x3d.clone()), x3d.clone()),
+            (AppAction::SaveAs(project.clone()), project.clone()),
+        ] {
+            app.apply_action(action).expect("export");
+            assert!(path.exists(), "missing {}", path.display());
+        }
+        app.apply_action(AppAction::New).expect("new again");
+        app.apply_action(AppAction::Load(project.clone()))
+            .expect("load");
+        assert!(app.egui_app.document().is_some());
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
