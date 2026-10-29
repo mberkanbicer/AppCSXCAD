@@ -10,6 +10,7 @@ name = "appcsxcad"
 path = "src/main.rs"
 
 [dependencies]
+png = "0.17"
 qcsxcad-egui = { path = "../../QCSXCAD/rust-egui" }
 qcsxcad-core = { path = "../../QCSXCAD/rust" }
 csxcad-core = { path = "../../CSXCAD/rust" }

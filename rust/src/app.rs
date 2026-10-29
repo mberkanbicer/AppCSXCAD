@@ -78,6 +78,39 @@ impl AppSettings {
     }
 }
 
+/// Decode a native QCSXCAD/Qt icon and cache it in the egui context.
+fn icon_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(name);
+    if let Some(handle) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(id)) {
+        return Some(handle);
+    }
+    let decoder = png::Decoder::new(bytes);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buffer).ok()?;
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [info.width as usize, info.height as usize],
+        &buffer[..info.buffer_size()],
+    );
+    let handle = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|data| data.insert_temp(id, handle.clone()));
+    Some(handle)
+}
+
+fn menu_item(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: Option<&egui::TextureHandle>,
+) -> egui::Response {
+    match icon {
+        Some(texture) => {
+            let sized = egui::load::SizedTexture::new(texture.id(), texture.size_vec2());
+            ui.add(egui::Button::image_and_text(sized, label))
+        }
+        None => ui.button(label),
+    }
+}
+
 /// One pending file operation, applied after the frame is drawn.
 #[derive(Clone, Debug, PartialEq)]
 enum AppAction {
@@ -174,22 +207,37 @@ impl AppUiState {
 
     /// Draw the menu bar. Runs inside the egui frame, before the QCSXCAD panels.
     fn menu(&mut self, ui: &mut egui::Ui, edit_mode: bool, has_document: bool) {
+        let ctx = ui.ctx().clone();
+        let mut icons = std::collections::HashMap::new();
+        for (name, bytes) in [
+            ("filenew", &include_bytes!("../../../QCSXCAD/images/filenew.png")[..]),
+            ("fileopen", &include_bytes!("../../../QCSXCAD/images/fileopen.png")[..]),
+            ("filesave", &include_bytes!("../../../QCSXCAD/images/filesave.png")[..]),
+            ("filesaveas", &include_bytes!("../../../QCSXCAD/images/filesaveas.png")[..]),
+            ("exit", &include_bytes!("../../../QCSXCAD/images/exit.png")[..]),
+            ("collapse", &include_bytes!("../../../QCSXCAD/images/viewmag-.png")[..]),
+            ("expand", &include_bytes!("../../../QCSXCAD/images/viewmag+.png")[..]),
+        ] {
+            if let Some(texture) = icon_texture(&ctx, name, bytes) {
+                icons.insert(name, texture);
+            }
+        }
         egui::Panel::top("app_menu").show(ui, |ui| {
             egui::menu::MenuBar::default().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if edit_mode && ui.button("New").clicked() {
+                    if edit_mode && menu_item(ui, "New", icons.get("filenew")).clicked() {
                         self.action = Some(AppAction::New);
                         ui.close();
                     }
-                    if ui.button("Load…").clicked() {
+                    if menu_item(ui, "Load", icons.get("fileopen")).clicked() {
                         self.open_dialog(Dialog::Load, "");
                         ui.close();
                     }
-                    if edit_mode && ui.button("Save").clicked() {
+                    if edit_mode && menu_item(ui, "Save", icons.get("filesave")).clicked() {
                         self.action = Some(AppAction::Save);
                         ui.close();
                     }
-                    if edit_mode && ui.button("Save As…").clicked() {
+                    if edit_mode && menu_item(ui, "Save As", icons.get("filesaveas")).clicked() {
                         self.open_dialog(Dialog::SaveAs, "");
                         ui.close();
                     }
@@ -231,7 +279,7 @@ impl AppUiState {
                         self.open_dialog(Dialog::ExportPng, "view.png");
                     }
                     ui.separator();
-                    if ui.button("Exit").clicked() {
+                    if menu_item(ui, "Exit", icons.get("exit")).clicked() {
                         self.action = Some(AppAction::Exit);
                         ui.close();
                     }
@@ -255,26 +303,26 @@ impl AppUiState {
         egui::Panel::top("app_toolbar").show(ui, |ui| {
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if edit_mode && ui.button("New").clicked() {
+                    if edit_mode && menu_item(ui, "New", icons.get("filenew")).clicked() {
                         self.action = Some(AppAction::New);
                     }
-                    if ui.button("Load").clicked() {
+                    if menu_item(ui, "Load", icons.get("fileopen")).clicked() {
                         self.open_dialog(Dialog::Load, "");
                     }
-                    if edit_mode && ui.button("Save").clicked() {
+                    if edit_mode && menu_item(ui, "Save", icons.get("filesave")).clicked() {
                         self.action = Some(AppAction::Save);
                     }
-                    if edit_mode && ui.button("Save As").clicked() {
+                    if edit_mode && menu_item(ui, "Save As", icons.get("filesaveas")).clicked() {
                         self.open_dialog(Dialog::SaveAs, "");
                     }
                     if ui.button("Export").clicked() {
                         self.open_dialog(Dialog::ExportXml, "");
                     }
                     ui.separator();
-                    if ui.button("CollapseAll").clicked() {
+                    if menu_item(ui, "CollapseAll", icons.get("collapse")).clicked() {
                         self.action = Some(AppAction::CollapseAll);
                     }
-                    if ui.button("ExpandAll").clicked() {
+                    if menu_item(ui, "ExpandAll", icons.get("expand")).clicked() {
                         self.action = Some(AppAction::ExpandAll);
                     }
                     for (label, kind) in [
