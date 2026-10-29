@@ -9,7 +9,7 @@ use qcsxcad_core::export::{self, PropertyFormat};
 use csxcad_core::model::{PrimitiveType, PropertyType, Structure};
 use qcsxcad_core::model::{GuiError, GuiState};
 use qcsxcad_core::ProjectFile;
-use qcsxcad_egui::EguiApp;
+use qcsxcad_egui::{EguiApp, TransformMode};
 use std::path::{Path, PathBuf};
 use winit::event::Event;
 
@@ -128,6 +128,7 @@ enum AppAction {
     ExpandAll,
     CollapseAll,
     ViewDir(i32),
+    TransformMode(TransformMode),
     Exit,
 }
 
@@ -354,6 +355,16 @@ impl AppUiState {
                             self.action = Some(AppAction::ViewDir(dir));
                         }
                     }
+                    ui.separator();
+                    for (label, mode) in [
+                        ("Move", TransformMode::Move),
+                        ("Rotate", TransformMode::Rotate),
+                        ("Scale", TransformMode::Scale),
+                    ] {
+                        if ui.button(label).clicked() {
+                            self.action = Some(AppAction::TransformMode(mode));
+                        }
+                    }
                 });
             });
         });
@@ -573,6 +584,10 @@ impl AppCsxCad {
             }
             AppAction::ViewDir(dir) => {
                 self.egui_app.set_view_dir(dir);
+                Ok(())
+            }
+            AppAction::TransformMode(mode) => {
+                self.egui_app.set_transform_mode(mode);
                 Ok(())
             }
             AppAction::Exit => {
@@ -799,6 +814,29 @@ mod tests {
 
     fn app() -> AppCsxCad {
         AppCsxCad::new(EguiApp::new())
+    }
+
+    #[test]
+    fn new_clears_the_loaded_project() {
+        let directory = temp_dir("new");
+        let source = directory.join("project.xml");
+        std::fs::write(&source, PROJECT).expect("write fixture");
+        let mut app = app();
+        app.load_path(&source).expect("load");
+        assert!(app.egui_app.document().is_some());
+        app.apply_action(AppAction::New).expect("new");
+        assert!(app.egui_app.document().is_none());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn transform_tools_switch_the_viewport_mode() {
+        let mut app = app();
+        for mode in [TransformMode::Rotate, TransformMode::Scale, TransformMode::Move] {
+            app.apply_action(AppAction::TransformMode(mode))
+                .expect("mode");
+            assert_eq!(app.egui_app.get_transform_mode(), mode);
+        }
     }
 
     #[test]
