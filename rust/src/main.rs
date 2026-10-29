@@ -52,12 +52,19 @@ impl ApplicationHandler<()> for AppHandler {
     fn window_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
-        _window_id: winit::window::WindowId,
+        window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
         let Some(app) = self.app.as_mut() else {
             return;
         };
+
+        // Forward every event to the egui application; without this the UI
+        // renders but never receives mouse or keyboard input.
+        app.handle_event(&winit::event::Event::WindowEvent {
+            window_id,
+            event: event.clone(),
+        });
 
         match event {
             WindowEvent::CloseRequested => {
@@ -66,6 +73,7 @@ impl ApplicationHandler<()> for AppHandler {
             }
             WindowEvent::Resized(size) => {
                 app.handle_resize(size.width, size.height);
+                app.request_redraw();
             }
             WindowEvent::RedrawRequested => {
                 if let Err(e) = app.render() {
@@ -74,12 +82,6 @@ impl ApplicationHandler<()> for AppHandler {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(app) = self.app.as_ref() {
-            app.request_redraw();
         }
     }
 }

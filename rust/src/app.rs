@@ -484,6 +484,9 @@ impl AppCsxCad {
             if let Err(error) = self.apply_action(action) {
                 self.ui_state.error = Some(error.to_string());
             }
+            // The action changed the document or the view after the frame was
+            // drawn: paint once more.
+            self.request_redraw();
         }
         Ok(())
     }
