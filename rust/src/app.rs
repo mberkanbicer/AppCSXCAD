@@ -6,6 +6,7 @@
 //! actions, command-line arguments and window settings.
 
 use qcsxcad_core::export::{self, PropertyFormat};
+use csxcad_core::model::{PrimitiveType, PropertyType, Structure};
 use qcsxcad_core::model::{GuiError, GuiState};
 use qcsxcad_core::ProjectFile;
 use qcsxcad_egui::EguiApp;
@@ -89,6 +90,11 @@ enum AppAction {
     ExportPovray(PathBuf),
     ExportX3d(PathBuf),
     ExportPng(PathBuf),
+    AddProperty(PropertyType),
+    AddPrimitive(PrimitiveType),
+    ExpandAll,
+    CollapseAll,
+    ViewDir(i32),
     Exit,
 }
 
@@ -243,9 +249,69 @@ impl AppUiState {
             });
         });
 
+        // Native AppCSXCAD toolbar. The object creation actions are not wired
+        // yet (RM-152); the labels are shown so the layout matches the native
+        // window while the feature port lands.
+        egui::Panel::top("app_toolbar").show(ui, |ui| {
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if edit_mode && ui.button("New").clicked() {
+                        self.action = Some(AppAction::New);
+                    }
+                    if ui.button("Load").clicked() {
+                        self.open_dialog(Dialog::Load, "");
+                    }
+                    if edit_mode && ui.button("Save").clicked() {
+                        self.action = Some(AppAction::Save);
+                    }
+                    if edit_mode && ui.button("Save As").clicked() {
+                        self.open_dialog(Dialog::SaveAs, "");
+                    }
+                    if ui.button("Export").clicked() {
+                        self.open_dialog(Dialog::ExportXml, "");
+                    }
+                    ui.separator();
+                    if ui.button("CollapseAll").clicked() {
+                        self.action = Some(AppAction::CollapseAll);
+                    }
+                    if ui.button("ExpandAll").clicked() {
+                        self.action = Some(AppAction::ExpandAll);
+                    }
+                    for (label, kind) in [
+                        ("Material", PropertyType::Material),
+                        ("Metal", PropertyType::Metal),
+                        ("Electrode", PropertyType::Metal),
+                        ("ProbeBox", PropertyType::ProbeBox),
+                        ("ResBox", PropertyType::ResBox),
+                        ("DumpBox", PropertyType::DumpBox),
+                    ] {
+                        if ui.button(label).clicked() {
+                            self.action = Some(AppAction::AddProperty(kind));
+                        }
+                    }
+                    for (label, kind) in [
+                        ("Box", PrimitiveType::Box),
+                        ("MultiBox", PrimitiveType::MultiBox),
+                        ("Sphere", PrimitiveType::Sphere),
+                        ("Cylinder", PrimitiveType::Cylinder),
+                        ("Polygon", PrimitiveType::Polygon),
+                        ("User Defined", PrimitiveType::UserDefined),
+                    ] {
+                        if ui.button(label).clicked() {
+                            self.action = Some(AppAction::AddPrimitive(kind));
+                        }
+                    }
+                    for (label, dir) in [("YZ", 2), ("ZX", 1), ("2D", 0), ("3D", 3)] {
+                        if ui.button(label).clicked() {
+                            self.action = Some(AppAction::ViewDir(dir));
+                        }
+                    }
+                });
+            });
+        });
+
         self.show_dialog(ui);
-        self.show_about(ui);
-        if let Some(error) = &self.error {
+        self.show_about(ui);        if let Some(error) = &self.error {
             egui::Panel::bottom("app_error").show(ui, |ui| {
                 ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
             });
@@ -380,6 +446,55 @@ impl AppCsxCad {
             AppAction::ExportPovray(path) => self.export_povray(&path),
             AppAction::ExportX3d(path) => self.export_x3d(&path),
             AppAction::ExportPng(path) => self.export_view_png(&path),
+            AppAction::AddProperty(kind) => {
+                if self.egui_app.document().is_none() {
+                    self.egui_app.load_structure(Structure::new());
+                }
+                let id = self
+                    .egui_app
+                    .document_mut()
+                    .expect("document was just created")
+                    .add_property(kind)?;
+                self.egui_app.select_property(id);
+                Ok(())
+            }
+            AppAction::AddPrimitive(kind) => {
+                if self.egui_app.document().is_none() {
+                    self.egui_app.load_structure(Structure::new());
+                }
+                let property = self.egui_app.selection().properties.iter().copied().next();
+                let property = match property {
+                    Some(id) => id,
+                    None => {
+                        let id = self
+                            .egui_app
+                            .document_mut()
+                            .expect("document was just created")
+                            .add_property(PropertyType::Material)?;
+                        self.egui_app.select_property(id);
+                        id
+                    }
+                };
+                let id = self
+                    .egui_app
+                    .document_mut()
+                    .expect("document exists")
+                    .add_primitive(property, kind)?;
+                self.egui_app.select_primitive(id);
+                Ok(())
+            }
+            AppAction::ExpandAll => {
+                self.egui_app.expand_all();
+                Ok(())
+            }
+            AppAction::CollapseAll => {
+                self.egui_app.collapse_all();
+                Ok(())
+            }
+            AppAction::ViewDir(dir) => {
+                self.egui_app.set_view_dir(dir);
+                Ok(())
+            }
             AppAction::Exit => {
                 self.save_settings();
                 std::process::exit(0);
@@ -604,6 +719,51 @@ mod tests {
 
     fn app() -> AppCsxCad {
         AppCsxCad::new(EguiApp::new())
+    }
+
+    #[test]
+    fn toolbar_creates_a_property_and_a_primitive() {
+        let mut app = app();
+        app.apply_action(AppAction::AddProperty(PropertyType::Material))
+            .expect("add property");
+        let property = app
+            .egui_app
+            .selection()
+            .properties
+            .iter()
+            .copied()
+            .next()
+            .expect("the new property is selected");
+
+        app.apply_action(AppAction::AddPrimitive(PrimitiveType::Box))
+            .expect("add primitive");
+        assert_eq!(
+            app.egui_app
+                .document()
+                .unwrap()
+                .structure()
+                .property(property)
+                .unwrap()
+                .primitive_count(),
+            1
+        );
+
+        // The creation is one undo step.
+        app.egui_app.document_mut().unwrap().undo();
+        assert_eq!(
+            app.egui_app
+                .document()
+                .unwrap()
+                .structure()
+                .property(property)
+                .unwrap()
+                .primitive_count(),
+            0
+        );
+
+        app.apply_action(AppAction::ExpandAll).expect("expand");
+        app.apply_action(AppAction::CollapseAll).expect("collapse");
+        app.apply_action(AppAction::ViewDir(2)).expect("view preset");
     }
 
     #[test]
