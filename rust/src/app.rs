@@ -7,9 +7,11 @@
 
 use qcsxcad_core::export::{self, PropertyFormat};
 use csxcad_core::model::{PrimitiveType, PropertyType, Structure};
+use qcsxcad_core::document::Document;
 use qcsxcad_core::model::{GuiError, GuiState};
 use qcsxcad_core::ProjectFile;
-use qcsxcad_egui::{EguiApp, TransformMode};
+use qcsxcad_egui::app::chrome_frame;
+use qcsxcad_egui::{theme, EguiApp, TransformMode};
 use std::path::{Path, PathBuf};
 use winit::event::Event;
 
@@ -24,6 +26,13 @@ pub struct AppSettings {
     pub window_width: u32,
     #[serde(default = "default_height")]
     pub window_height: u32,
+    /// `dark`, `light` or `high-contrast`.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_theme() -> String {
+    "dark".to_owned()
 }
 
 fn default_width() -> u32 {
@@ -39,6 +48,7 @@ impl Default for AppSettings {
         Self {
             window_width: DEFAULT_WIDTH,
             window_height: DEFAULT_HEIGHT,
+            theme: default_theme(),
         }
     }
 }
@@ -111,6 +121,12 @@ fn menu_item(
     }
 }
 
+/// An icon-only command button. The accessible name is its tooltip.
+fn icon_button(ui: &mut egui::Ui, icon: &egui::TextureHandle) -> egui::Response {
+    let sized = egui::load::SizedTexture::new(icon.id(), icon.size_vec2());
+    ui.add(egui::Button::image(sized))
+}
+
 /// One pending file operation, applied after the frame is drawn.
 #[derive(Clone, Debug, PartialEq)]
 enum AppAction {
@@ -129,6 +145,9 @@ enum AppAction {
     CollapseAll,
     ViewDir(i32),
     TransformMode(TransformMode),
+    FitAll,
+    FitSelection,
+    SetProjection(bool),
     Exit,
 }
 
@@ -206,9 +225,22 @@ impl AppUiState {
         self.action.take()
     }
 
-    /// Draw the menu bar. Runs inside the egui frame, before the QCSXCAD panels.
-    fn menu(&mut self, ui: &mut egui::Ui, edit_mode: bool, has_document: bool) {
+    /// Draw the menu bar, the command strip and the dialogs.
+    ///
+    /// Runs inside the egui frame, before the QCSXCAD panels. It receives the
+    /// document and the presentation state so presentation-only commands
+    /// (undo, panels, theme) act directly instead of round-tripping through the
+    /// deferred file-action queue.
+    fn chrome(
+        &mut self,
+        ui: &mut egui::Ui,
+        document: &mut Document,
+        state: &mut GuiState,
+        edit_mode: bool,
+        has_document: bool,
+    ) {
         let ctx = ui.ctx().clone();
+        let palette = theme::palette(&ctx);
         let mut icons = std::collections::HashMap::new();
         for (name, bytes) in [
             ("filenew", &include_bytes!("../../../QCSXCAD/images/filenew.png")[..]),
@@ -223,159 +255,388 @@ impl AppUiState {
                 icons.insert(name, texture);
             }
         }
-        egui::Panel::top("app_menu").show(ui, |ui| {
-            egui::menu::MenuBar::default().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if edit_mode && menu_item(ui, "New", icons.get("filenew")).clicked() {
-                        self.action = Some(AppAction::New);
-                        ui.close();
-                    }
-                    if menu_item(ui, "Load", icons.get("fileopen")).clicked() {
-                        self.open_dialog(Dialog::Load, "");
-                        ui.close();
-                    }
-                    if edit_mode && menu_item(ui, "Save", icons.get("filesave")).clicked() {
-                        self.action = Some(AppAction::Save);
-                        ui.close();
-                    }
-                    if edit_mode && menu_item(ui, "Save As", icons.get("filesaveas")).clicked() {
-                        self.open_dialog(Dialog::SaveAs, "");
-                        ui.close();
-                    }
-                    ui.separator();
-                    ui.menu_button("Export", |ui| {
-                        if edit_mode && ui.button("CSXCAD XML").clicked() {
-                            self.open_dialog(Dialog::ExportXml, "");
+
+        // Shortcuts, ignored while a text field owns the keyboard.
+        if !ui.ctx().egui_wants_keyboard_input() {
+            let (new, open, save, save_as, capture) = ui.input_mut(|input| {
+                let save_as = input.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::S,
+                );
+                let save = input.consume_key(egui::Modifiers::COMMAND, egui::Key::S);
+                let open = input.consume_key(egui::Modifiers::COMMAND, egui::Key::O);
+                let new = input.consume_key(egui::Modifiers::COMMAND, egui::Key::N);
+                let capture = input.consume_key(egui::Modifiers::COMMAND, egui::Key::P);
+                (new, open, save, save_as, capture)
+            });
+            if new && edit_mode {
+                self.action = Some(AppAction::New);
+            }
+            if open {
+                self.open_dialog(Dialog::Load, "");
+            }
+            if save && edit_mode && has_document {
+                self.action = Some(AppAction::Save);
+            }
+            if save_as && edit_mode {
+                self.open_dialog(Dialog::SaveAs, "");
+            }
+            if capture {
+                self.open_dialog(Dialog::ExportPng, "view.png");
+            }
+
+            // Panel visibility has a keyboard path as well as the View menu.
+            let (tree, inspector) = ui.input_mut(|input| {
+                (
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::B),
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::I),
+                )
+            });
+            if tree {
+                state.show_structure_tree = !state.show_structure_tree;
+            }
+            if inspector {
+                state.show_inspector = !state.show_inspector;
+            }
+        }
+
+        egui::Panel::top("app_menu")
+            .frame(chrome_frame(palette))
+            .show(ui, |ui| {
+                egui::menu::MenuBar::default().ui(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if edit_mode && menu_item(ui, "New", icons.get("filenew")).clicked() {
+                            self.action = Some(AppAction::New);
                             ui.close();
                         }
-                        if ui.button("Polydata-VTK").clicked() {
-                            self.open_dialog(Dialog::ExportVtk, "vtk");
+                        if menu_item(ui, "Load", icons.get("fileopen")).clicked() {
+                            self.open_dialog(Dialog::Load, "");
                             ui.close();
                         }
-                        if ui.button("STL").clicked() {
-                            self.open_dialog(Dialog::ExportStl, "stl");
+                        if edit_mode && menu_item(ui, "Save", icons.get("filesave")).clicked() {
+                            self.action = Some(AppAction::Save);
                             ui.close();
                         }
-                        if ui.button("PLY").clicked() {
-                            self.open_dialog(Dialog::ExportPly, "ply");
+                        if edit_mode
+                            && menu_item(ui, "Save As", icons.get("filesaveas")).clicked()
+                        {
+                            self.open_dialog(Dialog::SaveAs, "");
                             ui.close();
                         }
-                        if ui.button("POV-Ray").clicked() {
-                            self.open_dialog(Dialog::ExportPovray, "scene.pov");
-                            ui.close();
-                        }
-                        if ui.button("X3D").clicked() {
-                            self.open_dialog(Dialog::ExportX3d, "scene.x3d");
-                            ui.close();
-                        }
-                        if ui.button("3D view to PNG").clicked() {
-                            self.open_dialog(Dialog::ExportPng, "view.png");
+                        ui.separator();
+                        ui.menu_button("Export", |ui| {
+                            if edit_mode && ui.button("CSXCAD XML").clicked() {
+                                self.open_dialog(Dialog::ExportXml, "");
+                                ui.close();
+                            }
+                            if ui.button("Polydata-VTK").clicked() {
+                                self.open_dialog(Dialog::ExportVtk, "vtk");
+                                ui.close();
+                            }
+                            if ui.button("STL").clicked() {
+                                self.open_dialog(Dialog::ExportStl, "stl");
+                                ui.close();
+                            }
+                            if ui.button("PLY").clicked() {
+                                self.open_dialog(Dialog::ExportPly, "ply");
+                                ui.close();
+                            }
+                            if ui.button("POV-Ray").clicked() {
+                                self.open_dialog(Dialog::ExportPovray, "scene.pov");
+                                ui.close();
+                            }
+                            if ui.button("X3D").clicked() {
+                                self.open_dialog(Dialog::ExportX3d, "scene.x3d");
+                                ui.close();
+                            }
+                            if ui.button("3D view to PNG").clicked() {
+                                self.open_dialog(Dialog::ExportPng, "view.png");
+                                ui.close();
+                            }
+                        });
+                        ui.separator();
+                        if menu_item(ui, "Exit", icons.get("exit")).clicked() {
+                            self.action = Some(AppAction::Exit);
                             ui.close();
                         }
                     });
-                    ui.separator();
-                    if menu_item(ui, "Exit", icons.get("exit")).clicked() {
-                        self.action = Some(AppAction::Exit);
-                        ui.close();
-                    }
-                });
-                ui.menu_button("Info", |ui| {
-                    if ui.button("About").clicked() {
-                        self.about = true;
-                        ui.close();
-                    }
-                });
-                // Native Ctrl+P shortcut for the 3D view capture. It lives on
-                // the menu bar, not inside the File menu, so it also works
-                // while no menu is open.
-                if ui.input_mut(|input| {
-                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::P)
-                }) {
-                    self.open_dialog(Dialog::ExportPng, "view.png");
-                }
-                ui.separator();
-                if !has_document {
-                    ui.label("no project loaded");
-                }
-            });
-        });
 
-        // Native AppCSXCAD toolbar. The object creation actions are not wired
-        // yet (RM-152); the labels are shown so the layout matches the native
-        // window while the feature port lands.
-        egui::Panel::top("app_toolbar").show(ui, |ui| {
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if edit_mode && menu_item(ui, "New", icons.get("filenew")).clicked() {
-                        self.action = Some(AppAction::New);
-                    }
-                    if menu_item(ui, "Load", icons.get("fileopen")).clicked() {
-                        self.open_dialog(Dialog::Load, "");
-                    }
-                    if edit_mode && menu_item(ui, "Save", icons.get("filesave")).clicked() {
-                        self.action = Some(AppAction::Save);
-                    }
-                    if edit_mode && menu_item(ui, "Save As", icons.get("filesaveas")).clicked() {
-                        self.open_dialog(Dialog::SaveAs, "");
-                    }
-                    if ui.button("Export").clicked() {
-                        self.open_dialog(Dialog::ExportXml, "");
-                    }
-                    ui.separator();
-                    if menu_item(ui, "CollapseAll", icons.get("collapse")).clicked() {
-                        self.action = Some(AppAction::CollapseAll);
-                    }
-                    if menu_item(ui, "ExpandAll", icons.get("expand")).clicked() {
-                        self.action = Some(AppAction::ExpandAll);
-                    }
-                    for (label, kind) in [
-                        ("Material", PropertyType::Material),
-                        ("Metal", PropertyType::Metal),
-                        ("Excitation", PropertyType::Excitation),
-                        ("ProbeBox", PropertyType::ProbeBox),
-                        ("ResBox", PropertyType::ResBox),
-                        ("DumpBox", PropertyType::DumpBox),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.action = Some(AppAction::AddProperty(kind));
+                    ui.menu_button("Edit", |ui| {
+                        if ui
+                            .add_enabled(
+                                document.can_undo(),
+                                egui::Button::new("Undo").shortcut_text("Ctrl+Z"),
+                            )
+                            .clicked()
+                        {
+                            document.undo();
+                            ctx.request_repaint();
+                            ui.close();
                         }
-                    }
-                    for (label, kind) in [
-                        ("Box", PrimitiveType::Box),
-                        ("MultiBox", PrimitiveType::MultiBox),
-                        ("Sphere", PrimitiveType::Sphere),
-                        ("Cylinder", PrimitiveType::Cylinder),
-                        ("Polygon", PrimitiveType::Polygon),
-                        ("User Defined", PrimitiveType::UserDefined),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.action = Some(AppAction::AddPrimitive(kind));
+                        if ui
+                            .add_enabled(
+                                document.can_redo(),
+                                egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z"),
+                            )
+                            .clicked()
+                        {
+                            document.redo();
+                            ctx.request_repaint();
+                            ui.close();
                         }
-                    }
-                    for (label, dir) in [("YZ", 2), ("ZX", 1), ("2D", 0), ("3D", 3)] {
-                        if ui.button(label).clicked() {
-                            self.action = Some(AppAction::ViewDir(dir));
+                        ui.separator();
+                        let selected = state.selection.primitives.len()
+                            + state.selection.properties.len();
+                        ui.add_enabled(selected > 0, egui::Button::new("Delete selection"))
+                            .on_disabled_hover_text("Select an element in the tree or viewport first");
+                    });
+
+                    ui.menu_button("View", |ui| {
+                        if ui.button("Fit all").clicked() {
+                            self.action = Some(AppAction::FitAll);
+                            ui.close();
                         }
-                    }
-                    ui.separator();
-                    for (label, mode) in [
-                        ("Move", TransformMode::Move),
-                        ("Rotate", TransformMode::Rotate),
-                        ("Scale", TransformMode::Scale),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.action = Some(AppAction::TransformMode(mode));
+                        if ui.button("Fit selection").clicked() {
+                            self.action = Some(AppAction::FitSelection);
+                            ui.close();
                         }
+                        ui.separator();
+                        for (label, dir, hover) in [
+                            ("Top", 0, "Look down the -Z axis"),
+                            ("Front", 1, "Look along the +Y axis"),
+                            ("Right", 2, "Look along the +X axis"),
+                            ("3D", 3, "Free perspective view"),
+                        ] {
+                            if ui
+                                .selectable_label(state.view_dir == dir, label)
+                                .on_hover_text(hover)
+                                .clicked()
+                            {
+                                self.action = Some(AppAction::ViewDir(dir));
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        let mut parallel = state.parallel_projection;
+                        if ui
+                            .checkbox(&mut parallel, "Parallel projection")
+                            .on_hover_text("Orthographic camera (no perspective foreshortening)")
+                            .changed()
+                        {
+                            self.action = Some(AppAction::SetProjection(parallel));
+                        }
+                        ui.separator();
+                        ui.menu_button("Theme", |ui| {
+                            for mode in theme::ThemeMode::ALL {
+                                if ui.radio(theme::current(ui.ctx()) == mode, mode.label()).clicked() {
+                                    theme::set(ui.ctx(), mode);
+                                    ui.close();
+                                }
+                            }
+                        });
+                        ui.separator();
+                        ui.checkbox(&mut state.show_structure_tree, "Structure tree   Ctrl+B");
+                        ui.checkbox(&mut state.show_inspector, "Inspector   Ctrl+I");
+                        ui.checkbox(&mut state.show_status_bar, "Status bar");
+                    });
+
+                    ui.menu_button("Info", |ui| {
+                        if ui.button("About").clicked() {
+                            self.about = true;
+                            ui.close();
+                        }
+                    });
+
+                    if !has_document {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("no project loaded").color(palette.text_tertiary),
+                        );
                     }
                 });
             });
-        });
+
+        // Command strip. Groups follow the work order: file, history, structure,
+        // creation, view, tool. It wraps instead of hiding commands when the
+        // window is narrow.
+        egui::Panel::top("app_toolbar")
+            .frame(chrome_frame(palette))
+            .show(ui, |ui| {
+                // Each command group is a nested horizontal row, so a wrap
+                // at narrow widths moves a whole group to the next line instead
+                // of splitting it.
+                ui.horizontal_wrapped(|ui| {
+                        if edit_mode && menu_item(ui, "New", icons.get("filenew"))
+                            .on_hover_text("New project (Ctrl+N)")
+                            .clicked()
+                        {
+                            self.action = Some(AppAction::New);
+                        }
+                        if menu_item(ui, "Load", icons.get("fileopen"))
+                            .on_hover_text("Load a CSXCAD project (Ctrl+O)")
+                            .clicked()
+                        {
+                            self.open_dialog(Dialog::Load, "");
+                        }
+                        if edit_mode
+                            && menu_item(ui, "Save", icons.get("filesave"))
+                                .on_hover_text("Save (Ctrl+S)")
+                                .clicked()
+                        {
+                            self.action = Some(AppAction::Save);
+                        }
+                        if edit_mode
+                            && menu_item(ui, "Save As", icons.get("filesaveas"))
+                                .on_hover_text("Save as (Ctrl+Shift+S)")
+                                .clicked()
+                        {
+                            self.open_dialog(Dialog::SaveAs, "");
+                        }
+                    ui.separator();
+                        if ui
+                            .add_enabled(document.can_undo(), egui::Button::new("Undo"))
+                            .on_hover_text("Undo the last edit (Ctrl+Z)")
+                            .clicked()
+                        {
+                            document.undo();
+                            ctx.request_repaint();
+                        }
+                        if ui
+                            .add_enabled(document.can_redo(), egui::Button::new("Redo"))
+                            .on_hover_text("Redo (Ctrl+Shift+Z)")
+                            .clicked()
+                        {
+                            document.redo();
+                            ctx.request_repaint();
+                        }
+                    ui.separator();
+                        if let Some(icon) = icons.get("collapse") {
+                            if icon_button(ui, icon)
+                                .on_hover_text("Collapse the structure tree")
+                                .clicked()
+                            {
+                                self.action = Some(AppAction::CollapseAll);
+                            }
+                        }
+                        if let Some(icon) = icons.get("expand") {
+                            if icon_button(ui, icon)
+                                .on_hover_text("Expand the structure tree")
+                                .clicked()
+                            {
+                                self.action = Some(AppAction::ExpandAll);
+                            }
+                        }
+                    ui.separator();
+                        ui.menu_button("+ Property", |ui| {
+                            for (label, kind) in [
+                                ("Material", PropertyType::Material),
+                                ("Metal", PropertyType::Metal),
+                                ("Excitation", PropertyType::Excitation),
+                                ("ProbeBox", PropertyType::ProbeBox),
+                                ("ResBox", PropertyType::ResBox),
+                                ("DumpBox", PropertyType::DumpBox),
+                            ] {
+                                if ui
+                                    .button(label)
+                                    .on_hover_text(format!("Create a {kind:?} property"))
+                                    .clicked()
+                                {
+                                    self.action = Some(AppAction::AddProperty(kind));
+                                    ui.close();
+                                }
+                            }
+                        });
+                        ui.menu_button("+ Primitive", |ui| {
+                            for (label, kind) in [
+                                ("Box", PrimitiveType::Box),
+                                ("MultiBox", PrimitiveType::MultiBox),
+                                ("Sphere", PrimitiveType::Sphere),
+                                ("Cylinder", PrimitiveType::Cylinder),
+                                ("Polygon", PrimitiveType::Polygon),
+                                ("User Defined", PrimitiveType::UserDefined),
+                            ] {
+                                if ui
+                                    .button(label)
+                                    .on_hover_text(format!("Add a {kind:?} primitive"))
+                                    .clicked()
+                                {
+                                    self.action = Some(AppAction::AddPrimitive(kind));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    ui.separator();
+                        if ui
+                            .button("Fit")
+                            .on_hover_text("Frame all geometry")
+                            .clicked()
+                        {
+                            self.action = Some(AppAction::FitAll);
+                        }
+                        if ui
+                            .button("Fit Sel")
+                            .on_hover_text("Frame the selected geometry")
+                            .clicked()
+                        {
+                            self.action = Some(AppAction::FitSelection);
+                        }
+                    ui.separator();
+                        for mode in TransformMode::ALL {
+                            if ui
+                                .add(
+                                    egui::Button::new(mode.label())
+                                        .selected(state.transform_mode == mode),
+                                )
+                                .on_hover_text(match mode {
+                                    TransformMode::Move => "Drag moves the selected primitive",
+                                    TransformMode::Rotate => {
+                                        "Drag rotates the selected primitive (or Alt+drag)"
+                                    }
+                                    TransformMode::Scale => "Drag scales the selected primitive",
+                                })
+                                .clicked()
+                            {
+                                self.action = Some(AppAction::TransformMode(mode));
+                            }
+                        }
+                    ui.separator();
+                    // Keep the view presets together when the strip is narrow.
+                    // `available_width` is the panel width; the cursor position
+                    // is what tells us how much of the current line is left.
+                    let remaining = (ui.max_rect().right() - ui.cursor().left()).max(0.0);
+                    if remaining < 250.0 {
+                        ui.add_space(remaining);
+                    }
+                        for (label, dir) in [("Top", 0), ("Front", 1), ("Right", 2), ("3D", 3)] {
+                            if ui
+                                .add(egui::Button::new(label).selected(state.view_dir == dir))
+                                .on_hover_text(match dir {
+                                    0 => "Top view (XY, parallel)",
+                                    1 => "Front view (XZ, parallel)",
+                                    2 => "Right view (YZ, parallel)",
+                                    _ => "Free 3D view (perspective)",
+                                })
+                                .clicked()
+                            {
+                                self.action = Some(AppAction::ViewDir(dir));
+                            }
+                        }
+                });
+            });
 
         self.show_dialog(ui);
-        self.show_about(ui);        if let Some(error) = &self.error {
-            egui::Panel::bottom("app_error").show(ui, |ui| {
-                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
-            });
+        self.show_about(ui);
+        if let Some(error) = &self.error {
+            egui::Panel::bottom("app_error")
+                .frame(
+                    egui::Frame::new()
+                        .fill(palette.accent_soft)
+                        .inner_margin(egui::Margin::symmetric(theme::PANEL_PADDING, 4))
+                        .stroke(egui::Stroke::new(1.0, palette.danger)),
+                )
+                .show(ui, |ui| {
+                    ui.colored_label(palette.danger, error);
+                });
         }
     }
 
@@ -491,8 +752,8 @@ impl AppCsxCad {
         let has_document = self.egui_app.document().is_some();
         let ui_state = &mut self.ui_state;
         let egui_app = &mut self.egui_app;
-        egui_app.render_with(|root, _document, _state| {
-            ui_state.menu(root, edit_mode, has_document);
+        egui_app.render_with(|root, document, state| {
+            ui_state.chrome(root, document, state, edit_mode, has_document);
         })?;
         if let Some(action) = self.ui_state.take_action() {
             if let Err(error) = self.apply_action(action) {
@@ -605,6 +866,18 @@ impl AppCsxCad {
             }
             AppAction::TransformMode(mode) => {
                 self.egui_app.set_transform_mode(mode);
+                Ok(())
+            }
+            AppAction::FitAll => {
+                self.egui_app.fit_all();
+                Ok(())
+            }
+            AppAction::FitSelection => {
+                self.egui_app.fit_selection();
+                Ok(())
+            }
+            AppAction::SetProjection(enabled) => {
+                self.egui_app.set_parallel_projection(enabled);
                 Ok(())
             }
             AppAction::Exit => {
@@ -774,8 +1047,15 @@ impl AppCsxCad {
         AppSettings {
             window_width,
             window_height,
+            theme: self.egui_app.theme().name().to_owned(),
         }
         .save();
+    }
+
+    /// Apply a persisted theme name at startup.
+    pub fn set_theme_name(&mut self, name: &str) {
+        self.egui_app
+            .set_theme(qcsxcad_egui::theme::ThemeMode::from_name(name));
     }
 
     /// Window title, following the native "View Mode" suffix.
@@ -1160,6 +1440,7 @@ mod tests {
         let settings = AppSettings {
             window_width: 100,
             window_height: 10,
+            theme: "light".to_owned(),
         };
         assert_eq!(settings.window_size(), (320, 240));
         let settings = AppSettings::default();

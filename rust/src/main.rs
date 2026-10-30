@@ -41,6 +41,7 @@ impl ApplicationHandler<()> for AppHandler {
         pollster::block_on(egui_app.set_window(window));
 
         let mut app = AppCsxCad::new(egui_app);
+        app.set_theme_name(&settings.theme);
         // skip the program name; the native application only parses its own
         // arguments
         let args: Vec<String> = std::env::args().skip(1).collect();
