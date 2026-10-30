@@ -165,6 +165,176 @@ enum AppAction {
     Exit,
 }
 
+/// A command palette entry. File/view commands reuse `AppAction`; dialogs are
+/// opened through `Dialog`; presentation toggles act directly.
+#[derive(Clone, Debug, PartialEq)]
+enum Command {
+    Action(AppAction),
+    Dialog(Dialog),
+    Undo,
+    Redo,
+    ToggleProjection,
+    Theme(theme::ThemeMode),
+    ToggleStructureTree,
+    ToggleInspector,
+    ToggleStatusBar,
+    About,
+}
+
+#[derive(Clone, Debug)]
+struct CommandEntry {
+    id: &'static str,
+    label: &'static str,
+    category: &'static str,
+    shortcut: &'static str,
+    command: Command,
+}
+
+/// Every executable command with its stable id, menu category and shortcut.
+///
+/// The palette draws from this list only, so a command that is visible here is
+/// also wired to the same handler the menus use.
+fn command_entries(
+    edit_mode: bool,
+    has_document: bool,
+    can_undo: bool,
+    can_redo: bool,
+) -> Vec<CommandEntry> {
+    let mut entries = Vec::new();
+    let mut push = |id, label, category, shortcut, command| {
+        entries.push(CommandEntry {
+            id,
+            label,
+            category,
+            shortcut,
+            command,
+        })
+    };
+    if edit_mode {
+        push("file.new", "New project", "File", "Ctrl+N", Command::Action(AppAction::New));
+    }
+    push("file.load", "Load project", "File", "Ctrl+O", Command::Dialog(Dialog::Load));
+    if edit_mode && has_document {
+        push("file.save", "Save", "File", "Ctrl+S", Command::Action(AppAction::Save));
+    }
+    if edit_mode {
+        push(
+            "file.save_as",
+            "Save as",
+            "File",
+            "Ctrl+Shift+S",
+            Command::Dialog(Dialog::SaveAs),
+        );
+    }
+    if has_document {
+        for (id, label, dialog) in [
+            ("export.xml", "Export CSXCAD XML", Dialog::ExportXml),
+            ("export.vtk", "Export Polydata-VTK", Dialog::ExportVtk),
+            ("export.stl", "Export STL", Dialog::ExportStl),
+            ("export.ply", "Export PLY", Dialog::ExportPly),
+            ("export.pov", "Export POV-Ray", Dialog::ExportPovray),
+            ("export.x3d", "Export X3D", Dialog::ExportX3d),
+            ("export.png", "Export 3D view to PNG", Dialog::ExportPng),
+        ] {
+            push(id, label, "Export", "", Command::Dialog(dialog));
+        }
+    }
+    push("edit.expand", "Expand structure tree", "Edit", "", Command::Action(AppAction::ExpandAll));
+    push(
+        "edit.collapse",
+        "Collapse structure tree",
+        "Edit",
+        "",
+        Command::Action(AppAction::CollapseAll),
+    );
+    if can_undo {
+        push("edit.undo", "Undo", "Edit", "Ctrl+Z", Command::Undo);
+    }
+    if can_redo {
+        push("edit.redo", "Redo", "Edit", "Ctrl+Shift+Z", Command::Redo);
+    }
+    push("view.fit_all", "Fit all", "View", "", Command::Action(AppAction::FitAll));
+    push(
+        "view.fit_selection",
+        "Fit selection",
+        "View",
+        "",
+        Command::Action(AppAction::FitSelection),
+    );
+    for (id, label, dir) in [
+        ("view.top", "Top view", 0),
+        ("view.front", "Front view", 1),
+        ("view.right", "Right view", 2),
+        ("view.3d", "3D perspective view", 3),
+    ] {
+        push(id, label, "View", "", Command::Action(AppAction::ViewDir(dir)));
+    }
+    push(
+        "view.parallel",
+        "Toggle parallel projection",
+        "View",
+        "",
+        Command::ToggleProjection,
+    );
+    push(
+        "view.tree",
+        "Toggle structure tree",
+        "Panels",
+        "Ctrl+B",
+        Command::ToggleStructureTree,
+    );
+    push(
+        "view.inspector",
+        "Toggle inspector",
+        "Panels",
+        "Ctrl+I",
+        Command::ToggleInspector,
+    );
+    push(
+        "view.status",
+        "Toggle status bar",
+        "Panels",
+        "",
+        Command::ToggleStatusBar,
+    );
+    for mode in theme::ThemeMode::ALL {
+        push(
+            match mode {
+                theme::ThemeMode::Dark => "theme.dark",
+                theme::ThemeMode::Light => "theme.light",
+                theme::ThemeMode::HighContrast => "theme.high_contrast",
+            },
+            match mode {
+                theme::ThemeMode::Dark => "Theme: dark",
+                theme::ThemeMode::Light => "Theme: light",
+                theme::ThemeMode::HighContrast => "Theme: high contrast",
+            },
+            "Theme",
+            "",
+            Command::Theme(mode),
+        );
+    }
+    push("help.about", "About AppCSXCAD", "Help", "", Command::About);
+    if edit_mode {
+        push("file.exit", "Exit", "File", "", Command::Action(AppAction::Exit));
+    }
+    entries
+}
+
+/// Case-insensitive substring search over label, category and shortcut.
+fn filter_commands<'a>(entries: &'a [CommandEntry], query: &str) -> Vec<&'a CommandEntry> {
+    let needle = query.trim().to_ascii_lowercase();
+    entries
+        .iter()
+        .filter(|entry| {
+            needle.is_empty()
+                || entry.label.to_ascii_lowercase().contains(&needle)
+                || entry.category.to_ascii_lowercase().contains(&needle)
+                || entry.shortcut.to_ascii_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dialog {
     Load,
@@ -227,6 +397,9 @@ struct AppUiState {
     about: bool,
     error: Option<String>,
     action: Option<AppAction>,
+    palette_open: bool,
+    palette_query: String,
+    palette_focus: bool,
 }
 
 impl AppUiState {
@@ -297,6 +470,15 @@ impl AppUiState {
             }
             if capture {
                 self.open_dialog(Dialog::ExportPng, "view.png");
+            }
+            // Ctrl+K opens the command palette; consume the key so it does not
+            // also reach the tree or the viewport.
+            if ui
+                .input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::K))
+            {
+                self.palette_open = true;
+                self.palette_query.clear();
+                self.palette_focus = true;
             }
 
             // Panel visibility has a keyboard path as well as the View menu.
@@ -376,6 +558,16 @@ impl AppUiState {
                     });
 
                     ui.menu_button("Edit", |ui| {
+                        if ui
+                            .add(egui::Button::new("Command palette").shortcut_text("Ctrl+K"))
+                            .clicked()
+                        {
+                            self.palette_open = true;
+                            self.palette_query.clear();
+                            self.palette_focus = true;
+                            ui.close();
+                        }
+                        ui.separator();
                         if ui
                             .add_enabled(
                                 document.can_undo(),
@@ -638,6 +830,7 @@ impl AppUiState {
                 });
             });
 
+        self.command_palette(ui, document, state, edit_mode, has_document);
         self.show_dialog(ui);
         self.show_about(ui);
         if let Some(error) = &self.error {
@@ -651,6 +844,125 @@ impl AppUiState {
                 .show(ui, |ui| {
                     ui.colored_label(palette.danger, error);
                 });
+        }
+    }
+
+    /// Ctrl+K command search. Choosing a row runs the same handler as the menu
+    /// or toolbar; the list is the wired registry, not a separate command set.
+    fn command_palette(
+        &mut self,
+        ui: &mut egui::Ui,
+        document: &mut Document,
+        state: &mut GuiState,
+        edit_mode: bool,
+        has_document: bool,
+    ) {
+        if !self.palette_open {
+            return;
+        }
+        let entries = command_entries(
+            edit_mode,
+            has_document,
+            document.can_undo(),
+            document.can_redo(),
+        );
+        let palette = theme::palette(ui.ctx());
+        let mut execute = None;
+        let mut close = false;
+        egui::Window::new("Command palette")
+            .id(egui::Id::new("app_command_palette"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 72.0))
+            .show(ui.ctx(), |ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.palette_query)
+                        .hint_text("Search commands")
+                        .desired_width(520.0),
+                );
+                if self.palette_focus {
+                    response.request_focus();
+                    self.palette_focus = false;
+                }
+                if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+                let filtered = filter_commands(&entries, &self.palette_query);
+                if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    if let Some(entry) = filtered.first() {
+                        execute = Some(entry.command.clone());
+                    }
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        if filtered.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No matching command")
+                                    .color(palette.text_tertiary),
+                            );
+                        }
+                        for entry in &filtered {
+                            let label = if entry.shortcut.is_empty() {
+                                format!("{:<9} {}", entry.category, entry.label)
+                            } else {
+                                format!(
+                                    "{:<9} {}   {}",
+                                    entry.category, entry.label, entry.shortcut
+                                )
+                            };
+                            if ui
+                                .selectable_label(false, label)
+                                .on_hover_text(entry.id)
+                                .clicked()
+                            {
+                                execute = Some(entry.command.clone());
+                            }
+                        }
+                    });
+                ui.label(
+                    egui::RichText::new("Enter runs the first match - Esc closes")
+                        .small()
+                        .color(palette.text_tertiary),
+                );
+            });
+        if let Some(command) = execute {
+            self.palette_open = false;
+            self.execute_command(command, document, state, ui.ctx());
+        } else if close {
+            self.palette_open = false;
+        }
+    }
+
+    fn execute_command(
+        &mut self,
+        command: Command,
+        document: &mut Document,
+        state: &mut GuiState,
+        ctx: &egui::Context,
+    ) {
+        match command {
+            Command::Action(action) => self.action = Some(action),
+            Command::Dialog(dialog) => self.open_dialog(dialog, dialog.hint()),
+            Command::Undo => {
+                document.undo();
+                ctx.request_repaint();
+            }
+            Command::Redo => {
+                document.redo();
+                ctx.request_repaint();
+            }
+            Command::ToggleProjection => {
+                self.action = Some(AppAction::SetProjection(!state.parallel_projection));
+            }
+            Command::Theme(mode) => theme::set(ctx, mode),
+            Command::ToggleStructureTree => {
+                state.show_structure_tree = !state.show_structure_tree;
+            }
+            Command::ToggleInspector => state.show_inspector = !state.show_inspector,
+            Command::ToggleStatusBar => state.show_status_bar = !state.show_status_bar,
+            Command::About => self.about = true,
         }
     }
 
@@ -1476,5 +1788,82 @@ mod tests {
         assert_eq!(settings.window_size(), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
         assert_eq!(settings.tree_width, 320.0);
         assert_eq!(settings.inspector_width, 360.0);
+    }
+
+    #[test]
+    fn command_palette_ids_are_unique_and_wired() {
+        let entries = command_entries(true, true, true, true);
+        let mut ids = std::collections::HashSet::new();
+        for entry in &entries {
+            assert!(
+                ids.insert(entry.id),
+                "duplicate palette id {}",
+                entry.id
+            );
+            assert!(!entry.label.is_empty(), "{} has no label", entry.id);
+        }
+        for required in [
+            "file.new",
+            "file.save",
+            "edit.undo",
+            "edit.redo",
+            "view.fit_all",
+            "view.parallel",
+            "view.tree",
+            "theme.dark",
+            "theme.light",
+            "theme.high_contrast",
+            "help.about",
+        ] {
+            assert!(ids.contains(required), "missing {required}");
+        }
+    }
+
+    #[test]
+    fn command_palette_filter_matches_label_category_and_shortcut() {
+        let entries = command_entries(true, true, true, true);
+        let by_label = filter_commands(&entries, "save as");
+        assert_eq!(by_label.len(), 1);
+        assert_eq!(by_label[0].id, "file.save_as");
+
+        let by_category = filter_commands(&entries, "theme");
+        assert_eq!(by_category.len(), 3);
+        assert!(by_category
+            .iter()
+            .all(|entry| matches!(entry.command, Command::Theme(_))));
+
+        let by_shortcut = filter_commands(&entries, "ctrl+z");
+        assert_eq!(by_shortcut.len(), 1);
+        assert_eq!(by_shortcut[0].id, "edit.undo");
+
+        assert!(filter_commands(&entries, "no such command").is_empty());
+    }
+
+    #[test]
+    fn command_palette_hides_view_only_commands_in_view_mode() {
+        let view_entries = command_entries(false, true, false, false);
+        let ids: Vec<&str> = view_entries.iter().map(|entry| entry.id).collect();
+        assert!(ids.contains(&"file.load"));
+        assert!(ids.contains(&"export.xml"));
+        assert!(!ids.contains(&"file.new"));
+        assert!(!ids.contains(&"file.exit"));
+        assert!(!ids.contains(&"edit.undo"));
+        assert!(!ids.contains(&"edit.redo"));
+
+        let no_document = command_entries(true, false, false, false);
+        let ids: Vec<&str> = no_document.iter().map(|entry| entry.id).collect();
+        assert!(!ids.contains(&"file.save"));
+        assert!(!ids.contains(&"export.vtk"));
+    }
+
+    #[test]
+    fn command_palette_state_opens_and_closes() {
+        let mut app = app();
+        assert!(!app.ui_state().palette_open);
+        app.ui_state.palette_open = true;
+        app.ui_state.palette_focus = true;
+        app.ui_state.palette_query.push_str("fit");
+        assert!(app.ui_state().palette_open);
+        assert_eq!(app.ui_state().palette_query, "fit");
     }
 }
