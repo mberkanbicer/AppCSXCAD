@@ -42,6 +42,7 @@ impl ApplicationHandler<()> for AppHandler {
 
         let mut app = AppCsxCad::new(egui_app);
         app.set_theme_name(&settings.theme);
+        app.set_dock_widths(settings.tree_width, settings.inspector_width);
         // skip the program name; the native application only parses its own
         // arguments
         let args: Vec<String> = std::env::args().skip(1).collect();

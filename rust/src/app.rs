@@ -29,6 +29,18 @@ pub struct AppSettings {
     /// `dark`, `light` or `high-contrast`.
     #[serde(default = "default_theme")]
     pub theme: String,
+    #[serde(default = "default_tree_width")]
+    pub tree_width: f32,
+    #[serde(default = "default_inspector_width")]
+    pub inspector_width: f32,
+}
+
+fn default_tree_width() -> f32 {
+    320.0
+}
+
+fn default_inspector_width() -> f32 {
+    360.0
 }
 
 fn default_theme() -> String {
@@ -49,6 +61,8 @@ impl Default for AppSettings {
             window_width: DEFAULT_WIDTH,
             window_height: DEFAULT_HEIGHT,
             theme: default_theme(),
+            tree_width: default_tree_width(),
+            inspector_width: default_inspector_width(),
         }
     }
 }
@@ -1044,10 +1058,13 @@ impl AppCsxCad {
             .egui_app
             .window_size()
             .unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
+        let (tree_width, inspector_width) = self.egui_app.dock_widths();
         AppSettings {
             window_width,
             window_height,
             theme: self.egui_app.theme().name().to_owned(),
+            tree_width,
+            inspector_width,
         }
         .save();
     }
@@ -1056,6 +1073,11 @@ impl AppCsxCad {
     pub fn set_theme_name(&mut self, name: &str) {
         self.egui_app
             .set_theme(qcsxcad_egui::theme::ThemeMode::from_name(name));
+    }
+
+    /// Apply persisted dock widths at startup.
+    pub fn set_dock_widths(&mut self, tree: f32, inspector: f32) {
+        self.egui_app.set_dock_widths(tree, inspector);
     }
 
     /// Window title, following the native "View Mode" suffix.
@@ -1441,9 +1463,18 @@ mod tests {
             window_width: 100,
             window_height: 10,
             theme: "light".to_owned(),
+            tree_width: 300.0,
+            inspector_width: 400.0,
         };
         assert_eq!(settings.window_size(), (320, 240));
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let round_trip: AppSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_trip.tree_width, 300.0);
+        assert_eq!(round_trip.inspector_width, 400.0);
+        assert_eq!(round_trip.theme, "light");
         let settings = AppSettings::default();
         assert_eq!(settings.window_size(), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
+        assert_eq!(settings.tree_width, 320.0);
+        assert_eq!(settings.inspector_width, 360.0);
     }
 }
