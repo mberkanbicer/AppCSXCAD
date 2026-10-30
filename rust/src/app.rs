@@ -1857,6 +1857,40 @@ mod tests {
     }
 
     #[test]
+    fn palette_commands_execute_against_the_ui_state() {
+        let mut app = app();
+        let mut document = Document::new();
+        let mut state = GuiState::default();
+        let ctx = egui::Context::default();
+
+        let tree = state.show_structure_tree;
+        app.ui_state.execute_command(Command::ToggleStructureTree, &mut document, &mut state, &ctx);
+        assert_ne!(state.show_structure_tree, tree);
+
+        let inspector = state.show_inspector;
+        app.ui_state.execute_command(Command::ToggleInspector, &mut document, &mut state, &ctx);
+        assert_ne!(state.show_inspector, inspector);
+
+        let status = state.show_status_bar;
+        app.ui_state.execute_command(Command::ToggleStatusBar, &mut document, &mut state, &ctx);
+        assert_ne!(state.show_status_bar, status);
+
+        app.ui_state.execute_command(
+            Command::Action(AppAction::FitAll),
+            &mut document,
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(app.ui_state().action, Some(AppAction::FitAll));
+
+        app.ui_state.execute_command(Command::Dialog(Dialog::Load), &mut document, &mut state, &ctx);
+        assert_eq!(app.ui_state().dialog, Some(Dialog::Load));
+
+        app.ui_state.execute_command(Command::About, &mut document, &mut state, &ctx);
+        assert!(app.ui_state().about);
+    }
+
+    #[test]
     fn command_palette_state_opens_and_closes() {
         let mut app = app();
         assert!(!app.ui_state().palette_open);
