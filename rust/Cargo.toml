@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 png = "0.17"
-qcsxcad-egui = { path = "../../QCSXCAD/rust-egui" }
+qcsxcad-egui = { path = "../../QCSXCAD/rust-egui", features = ["docking"] }
 qcsxcad-core = { path = "../../QCSXCAD/rust" }
 csxcad-core = { path = "../../CSXCAD/rust" }
 egui = { version = "0.37", features = ["default_fonts"] }

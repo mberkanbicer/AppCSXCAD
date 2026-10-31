@@ -33,6 +33,9 @@ pub struct AppSettings {
     pub tree_width: f32,
     #[serde(default = "default_inspector_width")]
     pub inspector_width: f32,
+    /// Persisted drag-docking tree (ADR 0010); `None` uses the default layout.
+    #[serde(default)]
+    pub dock_layout: Option<String>,
 }
 
 fn default_tree_width() -> f32 {
@@ -63,6 +66,7 @@ impl Default for AppSettings {
             theme: default_theme(),
             tree_width: default_tree_width(),
             inspector_width: default_inspector_width(),
+            dock_layout: None,
         }
     }
 }
@@ -1377,8 +1381,14 @@ impl AppCsxCad {
             theme: self.egui_app.theme().name().to_owned(),
             tree_width,
             inspector_width,
+            dock_layout: self.egui_app.dock_layout_json(),
         }
         .save();
+    }
+
+    /// Apply a persisted drag-docking layout at startup.
+    pub fn set_dock_layout_json(&mut self, json: &str) {
+        self.egui_app.set_dock_layout_json(json);
     }
 
     /// Apply a persisted theme name at startup.
@@ -1777,11 +1787,13 @@ mod tests {
             theme: "light".to_owned(),
             tree_width: 300.0,
             inspector_width: 400.0,
+            dock_layout: Some("{\"tree\":\"test\"}".to_owned()),
         };
         assert_eq!(settings.window_size(), (320, 240));
         let json = serde_json::to_string(&settings).expect("serialize");
         let round_trip: AppSettings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_trip.tree_width, 300.0);
+        assert_eq!(round_trip.dock_layout.as_deref(), Some("{\"tree\":\"test\"}"));
         assert_eq!(round_trip.inspector_width, 400.0);
         assert_eq!(round_trip.theme, "light");
         let settings = AppSettings::default();
